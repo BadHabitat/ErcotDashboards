@@ -2380,9 +2380,9 @@ with tab4:
             "Dotted": "dot",
         }
 
-        now = pd.Timestamp.now().floor("5min")
-        start_ts = now - pd.Timedelta(minutes=5)
-        end_ts = now + pd.Timedelta(hours=2)
+        ercot_now = pd.Timestamp.now(tz="America/Chicago").tz_localize(None).floor("5min")
+        start_ts = ercot_now - pd.Timedelta(minutes=5)
+        end_ts = ercot_now + pd.Timedelta(hours=2)
 
         # ---------------------------------------------------
         # LOAD DATA
