@@ -4,6 +4,8 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 import numpy as np
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # -----------------------------
 # CONFIG
@@ -493,18 +495,20 @@ if page == "SCED Constraints":
         except Exception as e:
             st.error(str(e))
         # -----------------------------
-        # TAB 2 - WIND DATA
+        # TAB 2 - WIND TRADER VIEW
         # -----------------------------
 elif page == "Wind Trader View":
-        st.caption("ERCOT Wind Trader View - Actuals, Forecast Errors, and Revisions")
+        st.caption("ERCOT Wind Trader View")
 
         ACTUAL_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-743-cd"
-        FORECAST_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-751-cd"
+        INTRAHOUR_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-751-cd"
+        NP4732_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-732-cd"
+        NP4442_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-442-cd"
 
 
-        # ---------------------------------------------------
-        # PRODUCT / ARTIFACT HELPERS
-        # ---------------------------------------------------
+        # =====================================================
+        # API HELPERS
+        # =====================================================
         @st.cache_data(ttl=300)
         def get_product_metadata(product_url: str) -> dict:
             r = requests.get(product_url, headers=get_headers(), timeout=60)
@@ -526,7 +530,7 @@ elif page == "Wind Trader View":
                 if endpoint:
                     score += 1
                 if "csv" in blob:
-                    score += 5
+                    score += 10
                 if "xml" in blob:
                     score -= 1
                 if "zip" in blob:
@@ -542,8 +546,8 @@ elif page == "Wind Trader View":
 
         @st.cache_data(ttl=300)
         def get_artifact_endpoint(product_url: str):
-            product = get_product_metadata(product_url)
-            artifacts = product.get("artifacts", [])
+            meta = get_product_metadata(product_url)
+            artifacts = meta.get("artifacts", [])
             if not artifacts:
                 raise ValueError(f"No artifacts found for product: {product_url}")
 
@@ -552,21 +556,30 @@ elif page == "Wind Trader View":
             if not endpoint:
                 raise ValueError(f"Could not find artifact endpoint for product: {product_url}")
 
-            return endpoint, artifacts
+            return endpoint
 
 
         @st.cache_data(ttl=300)
-        def load_report(endpoint: str, posted_from=None, posted_to=None, size=10000):
+        def load_report(endpoint: str, posted_from=None, posted_to=None, size=10000, timeout=60):
             params = {"size": size}
             if posted_from:
                 params["postedDatetimeFrom"] = posted_from
             if posted_to:
                 params["postedDatetimeTo"] = posted_to
 
-            r = requests.get(endpoint, headers=get_headers(), params=params, timeout=120)
-            r.raise_for_status()
-            payload = r.json()
+            session = requests.Session()
+            retries = Retry(
+                total=2,
+                backoff_factor=1.0,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET"],
+            )
+            session.mount("https://", HTTPAdapter(max_retries=retries))
 
+            r = session.get(endpoint, headers=get_headers(), params=params, timeout=timeout)
+            r.raise_for_status()
+
+            payload = r.json()
             fields = payload.get("fields", [])
             rows = payload.get("data", [])
 
@@ -577,15 +590,48 @@ elif page == "Wind Trader View":
             return pd.DataFrame(rows, columns=cols)
 
 
-        # ---------------------------------------------------
-        # DETECTION HELPERS
-        # ---------------------------------------------------
-        def detect_time_col(df: pd.DataFrame) -> str | None:
+        def safe_load_product(product_url: str, posted_from=None, posted_to=None, size=10000, timeout=60):
+            try:
+                endpoint = get_artifact_endpoint(product_url)
+                df = load_report(endpoint, posted_from=posted_from, posted_to=posted_to, size=size, timeout=timeout)
+                return {
+                    "ok": True,
+                    "endpoint": endpoint,
+                    "df": df,
+                    "error": None,
+                }
+            except Exception as e:
+                return {
+                    "ok": False,
+                    "endpoint": None,
+                    "df": pd.DataFrame(),
+                    "error": str(e),
+                }
+
+
+        # =====================================================
+        # GENERIC HELPERS
+        # =====================================================
+        def normalize_key(s: str) -> str:
+            return str(s).strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+
+
+        def pick_col(df: pd.DataFrame, candidates):
+            lower_map = {normalize_key(c): c for c in df.columns}
+            for cand in candidates:
+                key = normalize_key(cand)
+                if key in lower_map:
+                    return lower_map[key]
+            return None
+
+
+        def detect_time_col(df: pd.DataFrame):
             preferred = [
                 "intervalEnding",
                 "timestamp",
                 "datetime",
-                "postedDatetime",
+                "deliveryDatetime",
+                "deliveryDate",
             ]
             for c in preferred:
                 if c in df.columns:
@@ -595,14 +641,12 @@ elif page == "Wind Trader View":
                 cl = c.lower()
                 if "interval" in cl and "ending" in cl:
                     return c
-            for c in df.columns:
-                cl = c.lower()
-                if "timestamp" in cl or "datetime" in cl or ("time" in cl and "posted" not in cl):
+                if "timestamp" in cl or "datetime" in cl:
                     return c
             return None
 
 
-        def detect_posted_col(df: pd.DataFrame) -> str | None:
+        def detect_posted_col(df: pd.DataFrame):
             preferred = [
                 "postedDatetime",
                 "postedTime",
@@ -621,7 +665,7 @@ elif page == "Wind Trader View":
             return None
 
 
-        def detect_target_col(df: pd.DataFrame, posted_col: str | None) -> str | None:
+        def detect_target_col(df: pd.DataFrame, posted_col=None):
             preferred = [
                 "intervalEnding",
                 "forecastTime",
@@ -640,48 +684,98 @@ elif page == "Wind Trader View":
                 cl = c.lower()
                 if "interval" in cl and "ending" in cl:
                     return c
-            for c in df.columns:
-                if c == posted_col:
-                    continue
-                cl = c.lower()
                 if "forecast" in cl and "time" in cl:
                     return c
-            for c in df.columns:
-                if c == posted_col:
-                    continue
-                cl = c.lower()
                 if "delivery" in cl and ("time" in cl or "date" in cl):
                     return c
-            for c in df.columns:
-                if c == posted_col:
-                    continue
-                cl = c.lower()
-                if "time" in cl or "date" in cl or "timestamp" in cl or "datetime" in cl:
+                if "timestamp" in cl or "datetime" in cl:
                     return c
             return None
 
 
-        def build_region_aliases():
+        def align_index(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp):
+            if df.empty:
+                return df
+            return df[(df.index >= start_ts) & (df.index <= end_ts)].copy()
+
+
+        def build_base_figure(height=500, yaxis_title="MW"):
+            fig = go.Figure()
+            fig.update_layout(
+                height=height,
+                hovermode="x unified",
+                yaxis_title=yaxis_title,
+                xaxis_title="Time",
+                legend_title_text="Series",
+                margin=dict(l=20, r=20, t=20, b=20),
+            )
+            return fig
+
+
+        def make_error_frame(actual_series: pd.Series, forecast_series: pd.Series):
+            combined = pd.concat(
+                [
+                    actual_series.rename("actual"),
+                    forecast_series.rename("forecast"),
+                ],
+                axis=1
+            ).dropna()
+
+            if combined.empty:
+                return combined
+
+            combined["error_mw"] = combined["forecast"] - combined["actual"]
+            combined["abs_error_mw"] = combined["error_mw"].abs()
+            combined["pct_error"] = np.where(
+                combined["actual"].abs() > 1e-9,
+                (combined["error_mw"] / combined["actual"]) * 100.0,
+                np.nan
+            )
+            combined["ape"] = combined["pct_error"].abs()
+            return combined
+
+
+        # =====================================================
+        # MAIN WIND REGION HELPERS (NP4-743 / NP4-751)
+        # =====================================================
+        def main_region_order():
+            return ["ERCOT Total", "Panhandle", "Coastal", "South", "West", "North"]
+
+
+        def main_region_aliases():
             return {
                 "panhandle": "Panhandle",
                 "coastal": "Coastal",
                 "south": "South",
                 "west": "West",
                 "north": "North",
+                "systemwide": "ERCOT Total",
+                "systemtotal": "ERCOT Total",
+                "ercottotal": "ERCOT Total",
+                "total": "ERCOT Total",
             }
 
 
-        def find_wide_region_columns(df: pd.DataFrame):
-            aliases = build_region_aliases()
-            lower_map = {c.lower().strip(): c for c in df.columns}
+        def normalize_main_region_name(x):
+            if pd.isna(x):
+                return None
+            s_norm = normalize_key(x)
+            aliases = main_region_aliases()
+            for alias, display in aliases.items():
+                if s_norm == alias or alias in s_norm:
+                    return display
+            return None
+
+
+        def find_main_wide_region_columns(df: pd.DataFrame):
+            aliases = main_region_aliases()
             found = {}
 
-            for alias, display in aliases.items():
-                for lc, orig in lower_map.items():
-                    norm = lc.replace("_", "").replace("-", "").replace(" ", "")
-                    if norm == alias:
-                        found[display] = orig
-                        break
+            for col in df.columns:
+                norm = normalize_key(col)
+                for alias, display in aliases.items():
+                    if alias in norm:
+                        found[display] = col
 
             return found
 
@@ -690,31 +784,31 @@ elif page == "Wind Trader View":
             region_col = None
             value_col = None
 
-            region_candidates = []
             for c in df.columns:
                 cl = c.lower()
-                if "region" in cl or "zone" in cl or "geograph" in cl:
-                    region_candidates.append(c)
+                if region_col is None and ("region" in cl or "zone" in cl or "geograph" in cl):
+                    region_col = c
 
-            value_candidates = []
             for c in df.columns:
                 cl = c.lower()
                 if any(x in cl for x in ["mw", "gen", "actual", "forecast", "output", "production", "value", "hsl"]):
                     numeric_test = pd.to_numeric(df[c], errors="coerce")
                     if numeric_test.notna().sum() > 0:
-                        value_candidates.append(c)
-
-            if region_candidates:
-                region_col = region_candidates[0]
-            if value_candidates:
-                value_col = value_candidates[0]
+                        value_col = c
+                        break
 
             return region_col, value_col
 
 
-        # ---------------------------------------------------
-        # ACTUAL NORMALIZATION
-        # ---------------------------------------------------
+        def add_main_total_if_missing(df: pd.DataFrame):
+            parts = [c for c in ["Panhandle", "Coastal", "South", "West", "North"] if c in df.columns]
+            if "ERCOT Total" not in df.columns and parts:
+                df["ERCOT Total"] = df[parts].sum(axis=1, min_count=1)
+
+            ordered = [c for c in main_region_order() if c in df.columns]
+            return df[ordered] if ordered else df
+
+
         def normalize_actual_regional_df(df: pd.DataFrame):
             df = convert_columns(df.copy())
 
@@ -725,13 +819,14 @@ elif page == "Wind Trader View":
             df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
             df = df.dropna(subset=[time_col]).copy()
 
-            wide_cols = find_wide_region_columns(df)
+            wide_cols = find_main_wide_region_columns(df)
             if wide_cols:
                 out = df[[time_col] + list(wide_cols.values())].copy()
                 out = out.rename(columns={v: k for k, v in wide_cols.items()})
 
-                for c in wide_cols.keys():
-                    out[c] = pd.to_numeric(out[c], errors="coerce")
+                for c in out.columns:
+                    if c != time_col:
+                        out[c] = pd.to_numeric(out[c], errors="coerce")
 
                 out = (
                     out.sort_values(time_col)
@@ -741,36 +836,20 @@ elif page == "Wind Trader View":
                     .mean()
                 )
 
-                region_order = [r for r in ["Panhandle", "Coastal", "South", "West", "North"] if r in out.columns]
-                out["ERCOT Total"] = out[region_order].sum(axis=1, min_count=1)
-                out = out[["ERCOT Total"] + region_order]
-                return out, time_col
+                return add_main_total_if_missing(out), time_col
 
             region_col, value_col = find_long_region_and_value_columns(df)
             if region_col and value_col:
                 temp = df[[time_col, region_col, value_col]].copy()
                 temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
                 temp = temp.dropna(subset=[value_col]).copy()
-
-                aliases = build_region_aliases()
-
-                def map_region(x):
-                    if pd.isna(x):
-                        return None
-                    s = str(x).strip().lower()
-                    s_norm = s.replace("_", "").replace("-", "").replace(" ", "")
-                    for alias, display in aliases.items():
-                        if s_norm == alias or alias in s_norm:
-                            return display
-                    return None
-
-                temp["_region_std"] = temp[region_col].map(map_region)
-                temp = temp.dropna(subset=["_region_std"]).copy()
+                temp["series"] = temp[region_col].map(normalize_main_region_name)
+                temp = temp.dropna(subset=["series"]).copy()
 
                 out = (
                     temp.pivot_table(
                         index=time_col,
-                        columns="_region_std",
+                        columns="series",
                         values=value_col,
                         aggfunc="mean"
                     )
@@ -779,40 +858,35 @@ elif page == "Wind Trader View":
                     .mean()
                 )
 
-                region_order = [r for r in ["Panhandle", "Coastal", "South", "West", "North"] if r in out.columns]
-                out["ERCOT Total"] = out[region_order].sum(axis=1, min_count=1)
-                out = out[["ERCOT Total"] + region_order]
-                return out, time_col
+                return add_main_total_if_missing(out), time_col
 
             raise ValueError(f"Actuals: Could not detect regional actuals format. Columns: {list(df.columns)}")
 
 
-        # ---------------------------------------------------
-        # FORECAST NORMALIZATION TO LONG FORMAT
-        # posted_ts | target_ts | series | mw
-        # ---------------------------------------------------
-        def normalize_forecast_long(df: pd.DataFrame):
+        def normalize_intrahour_forecast_long(df: pd.DataFrame):
             df = convert_columns(df.copy())
 
             posted_col = detect_posted_col(df)
             target_col = detect_target_col(df, posted_col)
 
             if not posted_col:
-                raise ValueError(f"Forecast: Could not detect posted timestamp column. Columns: {list(df.columns)}")
+                raise ValueError(
+                    f"Intra-hour forecast: Could not detect posted timestamp column. Columns: {list(df.columns)}")
             if not target_col:
-                raise ValueError(f"Forecast: Could not detect target timestamp column. Columns: {list(df.columns)}")
+                raise ValueError(
+                    f"Intra-hour forecast: Could not detect target timestamp column. Columns: {list(df.columns)}")
 
             df[posted_col] = pd.to_datetime(df[posted_col], errors="coerce")
             df[target_col] = pd.to_datetime(df[target_col], errors="coerce")
             df = df.dropna(subset=[posted_col, target_col]).copy()
 
-            wide_cols = find_wide_region_columns(df)
+            wide_cols = find_main_wide_region_columns(df)
             if wide_cols:
                 keep_cols = [posted_col, target_col] + list(wide_cols.values())
                 out = df[keep_cols].copy()
                 out = out.rename(columns={v: k for k, v in wide_cols.items()})
 
-                region_names = list(wide_cols.keys())
+                region_names = [c for c in main_region_order() if c in out.columns]
                 for c in region_names:
                     out[c] = pd.to_numeric(out[c], errors="coerce")
 
@@ -835,20 +909,7 @@ elif page == "Wind Trader View":
                 temp = df[[posted_col, target_col, region_col, value_col]].copy()
                 temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
                 temp = temp.dropna(subset=[value_col]).copy()
-
-                aliases = build_region_aliases()
-
-                def map_region(x):
-                    if pd.isna(x):
-                        return None
-                    s = str(x).strip().lower()
-                    s_norm = s.replace("_", "").replace("-", "").replace(" ", "")
-                    for alias, display in aliases.items():
-                        if s_norm == alias or alias in s_norm:
-                            return display
-                    return None
-
-                temp["series"] = temp[region_col].map(map_region)
+                temp["series"] = temp[region_col].map(normalize_main_region_name)
                 temp = temp.dropna(subset=["series"]).copy()
 
                 temp = temp.rename(columns={
@@ -859,17 +920,11 @@ elif page == "Wind Trader View":
 
                 return temp[["posted_ts", "target_ts", "series", "mw"]], posted_col, target_col
 
-            raise ValueError(f"Forecast: Could not detect regional forecast format. Columns: {list(df.columns)}")
+            raise ValueError(
+                f"Intra-hour forecast: Could not detect regional forecast format. Columns: {list(df.columns)}")
 
 
-        # ---------------------------------------------------
-        # FORECAST CURVE CONSTRUCTION
-        # ---------------------------------------------------
-        def build_lead_curve(forecast_long: pd.DataFrame, target_lead_minutes: int, series_order):
-            """
-            For each target_ts and series, choose the forecast whose lead time
-            (target_ts - posted_ts) is closest to target_lead_minutes, subject to posted_ts <= target_ts.
-            """
+        def build_intrahour_lead_curve(forecast_long: pd.DataFrame, target_lead_minutes: int):
             df = forecast_long.copy()
             df["lead_minutes"] = (df["target_ts"] - df["posted_ts"]).dt.total_seconds() / 60.0
             df = df[df["lead_minutes"] >= 0].copy()
@@ -879,7 +934,6 @@ elif page == "Wind Trader View":
                 return pd.DataFrame()
 
             df["score"] = (df["lead_minutes"] - target_lead_minutes).abs()
-
             df = df.sort_values(
                 by=["series", "target_ts", "score", "posted_ts"],
                 ascending=[True, True, True, False]
@@ -899,428 +953,984 @@ elif page == "Wind Trader View":
                 .mean()
             )
 
-            region_series = [s for s in ["Panhandle", "Coastal", "South", "West", "North"] if s in wide.columns]
-            if region_series:
-                wide["ERCOT Total"] = wide[region_series].sum(axis=1, min_count=1)
-
-            ordered = [s for s in series_order if s in wide.columns]
-            return wide[ordered] if ordered else wide
+            return add_main_total_if_missing(wide)
 
 
-        def align_index(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp):
-            if df.empty:
-                return df
-            return df[(df.index >= start_ts) & (df.index <= end_ts)].copy()
+        # =====================================================
+        # NP4-732 PARSER
+        # =====================================================
+        def normalize_np4732_hourly(df: pd.DataFrame):
+            df = df.copy()
 
+            # -----------------------------
+            # flexible column picker
+            # -----------------------------
+            def norm(s):
+                return str(s).strip().lower().replace("_", "").replace("-", "").replace(" ", "")
 
-        # ---------------------------------------------------
-        # CONTROLS
-        # ---------------------------------------------------
-        try:
-            st.subheader("Display Controls")
+            col_map = {norm(c): c for c in df.columns}
 
-            view_mode = st.selectbox(
-                "Mode",
-                options=[
-                    "Actual vs Forecast",
-                    "Forecast Error",
-                    "Forecast Revisions",
-                ],
-                index=0,
-                key="wind_view_mode"
-            )
+            def pick(*candidates):
+                for cand in candidates:
+                    key = norm(cand)
+                    if key in col_map:
+                        return col_map[key]
+                return None
 
-            period = st.selectbox(
-                "Selectable period",
-                options=[
-                    "Last 1 hour",
-                    "Last 3 hours",
-                    "Last 6 hours",
-                    "Last 12 hours",
-                    "Last 24 hours",
-                ],
-                index=2,
-                key="wind_period"
-            )
+            delivery_col = pick("DELIVERY_DATE", "deliveryDate")
+            he_col = pick("HOUR_ENDING", "hourEnding")
+            posted_col = pick("postedDatetime")
+            dst_col = pick("DSTFlag")
 
-            now = pd.Timestamp.now().floor("5min")
+            missing = []
+            if not delivery_col:
+                missing.append("DELIVERY_DATE/deliveryDate")
+            if not he_col:
+                missing.append("HOUR_ENDING/hourEnding")
 
-            if period == "Last 1 hour":
-                start_ts = now - pd.Timedelta(hours=1)
-                end_ts = now
-                hours_back = 1
-            elif period == "Last 3 hours":
-                start_ts = now - pd.Timedelta(hours=3)
-                end_ts = now
-                hours_back = 3
-            elif period == "Last 6 hours":
-                start_ts = now - pd.Timedelta(hours=6)
-                end_ts = now
-                hours_back = 6
-            elif period == "Last 12 hours":
-                start_ts = now - pd.Timedelta(hours=12)
-                end_ts = now
-                hours_back = 12
-            else:
-                start_ts = now - pd.Timedelta(hours=24)
-                end_ts = now
-                hours_back = 24
+            if missing:
+                raise ValueError(
+                    f"NP4-732 missing required columns: {missing}. Columns: {list(df.columns)}"
+                )
 
-            available_series = ["ERCOT Total", "Panhandle", "Coastal", "South", "West", "North"]
+            df[delivery_col] = pd.to_datetime(df[delivery_col], errors="coerce")
+            df[he_col] = pd.to_numeric(df[he_col], errors="coerce")
+            if posted_col:
+                df[posted_col] = pd.to_datetime(df[posted_col], errors="coerce")
 
-            selected_series = st.multiselect(
-                "Regions to graph",
-                options=available_series,
-                default=["ERCOT Total"],
-                key="wind_selected_series"
-            )
+            df = df.dropna(subset=[delivery_col, he_col]).copy()
 
-            if not selected_series:
-                st.warning("Select at least one region or total.")
-                st.stop()
+            # ERCOT HE 1-24 => ending timestamp
+            df["target_ts"] = df[delivery_col] + pd.to_timedelta(df[he_col], unit="h")
 
-            lead_options = {
-                "Latest": 0,
-                "1 hour ago": 60,
-                "2 hours ago": 120,
+            # -----------------------------
+            # column mappings for both schema variants
+            # -----------------------------
+            metric_region_map = {
+                # system wide
+                "SYSTEM_WIDE_GEN": ("Actual Gen", "ERCOT Total"),
+                "genSystemWide": ("Actual Gen", "ERCOT Total"),
+
+                "COP_HSL_SYSTEM_WIDE": ("COP HSL", "ERCOT Total"),
+                "COPHSLSystemWide": ("COP HSL", "ERCOT Total"),
+
+                "STWPF_SYSTEM_WIDE": ("STWPF", "ERCOT Total"),
+                "STWPFSystemWide": ("STWPF", "ERCOT Total"),
+
+                "WGRPP_SYSTEM_WIDE": ("WGRPP", "ERCOT Total"),
+                "WGRPPSystemWide": ("WGRPP", "ERCOT Total"),
+
+                "SYSTEM_WIDE_HSL": ("System HSL", "ERCOT Total"),
+                "HSLSystemWide": ("System HSL", "ERCOT Total"),
+
+                # south houston
+                "GEN_LZ_SOUTH_HOUSTON": ("Actual Gen", "South Houston"),
+                "genLoadZoneSouthHouston": ("Actual Gen", "South Houston"),
+
+                "COP_HSL_LZ_SOUTH_HOUSTON": ("COP HSL", "South Houston"),
+                "COPHSLLoadZoneSouthHouston": ("COP HSL", "South Houston"),
+
+                "STWPF_LZ_SOUTH_HOUSTON": ("STWPF", "South Houston"),
+                "STWPFLoadZoneSouthHouston": ("STWPF", "South Houston"),
+
+                "WGRPP_LZ_SOUTH_HOUSTON": ("WGRPP", "South Houston"),
+                "WGRPPLoadZoneSouthHouston": ("WGRPP", "South Houston"),
+
+                # west
+                "GEN_LZ_WEST": ("Actual Gen", "West"),
+                "genLoadZoneWest": ("Actual Gen", "West"),
+
+                "COP_HSL_LZ_WEST": ("COP HSL", "West"),
+                "COPHSLLoadZoneWest": ("COP HSL", "West"),
+
+                "STWPF_LZ_WEST": ("STWPF", "West"),
+                "STWPFLoadZoneWest": ("STWPF", "West"),
+
+                "WGRPP_LZ_WEST": ("WGRPP", "West"),
+                "WGRPPLoadZoneWest": ("WGRPP", "West"),
+
+                # north
+                "GEN_LZ_NORTH": ("Actual Gen", "North"),
+                "genLoadZoneNorth": ("Actual Gen", "North"),
+
+                "COP_HSL_LZ_NORTH": ("COP HSL", "North"),
+                "COPHSLLoadZoneNorth": ("COP HSL", "North"),
+
+                "STWPF_LZ_NORTH": ("STWPF", "North"),
+                "STWPFLoadZoneNorth": ("STWPF", "North"),
+
+                "WGRPP_LZ_NORTH": ("WGRPP", "North"),
+                "WGRPPLoadZoneNorth": ("WGRPP", "North"),
             }
 
-            selected_leads = st.multiselect(
-                "Forecast lines",
-                options=list(lead_options.keys()),
-                default=["Latest", "1 hour ago"],
-                key="wind_selected_leads"
+            long_frames = []
+
+            for raw_col, (metric_name, region_name) in metric_region_map.items():
+                if raw_col not in df.columns:
+                    continue
+
+                temp = df[["target_ts", raw_col]].copy()
+                if posted_col:
+                    temp["posted_ts"] = df[posted_col]
+
+                temp["metric"] = metric_name
+                temp["region"] = region_name
+                temp["mw"] = pd.to_numeric(temp[raw_col], errors="coerce")
+                temp = temp.dropna(subset=["mw"]).copy()
+
+                keep_cols = ["target_ts", "region", "metric", "mw"]
+                if posted_col:
+                    keep_cols.insert(1, "posted_ts")
+
+                long_frames.append(temp[keep_cols])
+
+            if not long_frames:
+                raise ValueError(
+                    f"NP4-732 parser found no usable metric columns. Columns: {list(df.columns)}"
+                )
+
+            long_df = pd.concat(long_frames, ignore_index=True)
+
+            # if posted timestamp exists, keep the latest row per target/metric/region
+            if "posted_ts" in long_df.columns:
+                long_df = (
+                    long_df.sort_values(["target_ts", "metric", "region", "posted_ts"])
+                    .drop_duplicates(subset=["target_ts", "metric", "region"], keep="last")
+                    .copy()
+                )
+
+            wide = (
+                long_df.pivot_table(
+                    index="target_ts",
+                    columns=["metric", "region"],
+                    values="mw",
+                    aggfunc="mean"
+                )
+                .sort_index()
             )
 
-            if not selected_leads:
-                st.warning("Select at least one forecast line.")
-                st.stop()
+            return long_df, wide
+        # =====================================================
+        # OPTIONAL NP4-442 COP MODEL STATUS PARSER
+        # =====================================================
+        def parse_np4442_cop_model_status(df: pd.DataFrame):
+            if df.empty:
+                return pd.DataFrame(), None
 
-            if hours_back <= 3:
-                actual_size = 5000
-                forecast_size = 15000
-            elif hours_back <= 6:
-                actual_size = 8000
-                forecast_size = 25000
-            elif hours_back <= 12:
-                actual_size = 12000
-                forecast_size = 40000
+            work = convert_columns(df.copy())
+            posted_col = detect_posted_col(work)
+            if posted_col and posted_col in work.columns:
+                work[posted_col] = pd.to_datetime(work[posted_col], errors="coerce")
+
+            region_col = pick_col(work, ["Region", "region", "WeatherZone", "zone", "Geography", "geography"])
+            model_col = pick_col(work, ["Model", "model", "ForecastModel", "forecastModel", "UsedModel", "usedModel"])
+            inuse_col = pick_col(work,
+                                 ["InUseFlag", "inUseFlag", "UsedToPopulateCOP", "usedToPopulateCOP", "UsedForCOP",
+                                  "usedForCOP", "UsedFlag"])
+            target_col = detect_target_col(work, posted_col)
+
+            if region_col is None or model_col is None:
+                return pd.DataFrame(), posted_col
+
+            if target_col and target_col in work.columns:
+                work[target_col] = pd.to_datetime(work[target_col], errors="coerce")
+
+            # try both main regions and NP4-732 regions
+            def normalize_any_region(x):
+                v = normalize_main_region_name(x)
+                if v:
+                    return v
+                s = normalize_key(x)
+                if "southhouston" in s:
+                    return "South Houston"
+                return None
+
+            work["Region"] = work[region_col].map(normalize_any_region)
+            work = work.dropna(subset=["Region"]).copy()
+
+            if inuse_col and inuse_col in work.columns:
+                active = work[
+                    work[inuse_col].astype(str).str.strip().str.upper().isin(["Y", "YES", "TRUE", "1"])].copy()
+                if not active.empty:
+                    work = active
+
+            sort_cols = []
+            if posted_col and posted_col in work.columns:
+                sort_cols.append(posted_col)
+            if target_col and target_col in work.columns:
+                sort_cols.append(target_col)
+
+            if sort_cols:
+                work = work.sort_values(sort_cols)
+
+            status = (
+                work.groupby("Region", as_index=False)
+                .tail(1)[["Region", model_col] + ([posted_col] if posted_col and posted_col in work.columns else [])]
+                .rename(columns={model_col: "COP Model"})
+                .sort_values("Region")
+            )
+
+            return status, posted_col
+
+
+        # =====================================================
+        # CONTROLS
+        # =====================================================
+        try:
+            st.subheader("Controls")
+
+            now = pd.Timestamp.now(tz="America/Chicago").tz_localize(None).floor("5min")
+
+            top1, top2, top3 = st.columns(3)
+
+            with top1:
+                trader_window = st.selectbox(
+                    "Trader View Window",
+                    ["Last 24 / Next 6", "Last 24 / Next 24", "Last 12 / Next 6", "Last 48 / Next 24"],
+                    index=0,
+                    key="wind_trader_window_v6"
+                )
+
+            with top2:
+                history_window = st.selectbox(
+                    "History Window",
+                    ["Last 24", "Last 48", "Last 72", "Last 168"],
+                    index=0,
+                    key="wind_history_window_v6"
+                )
+
+            with top3:
+                np4732_window = st.selectbox(
+                    "NP4-732 Window",
+                    ["Next 24", "Next 48", "Next 72", "Next 168", "Trader Span"],
+                    index=2,
+                    key="wind_np4732_window_v6"
+                )
+
+            use_exact_trader_range = st.checkbox(
+                "Use exact Trader View range",
+                value=False,
+                key="wind_exact_trader_range_v6"
+            )
+
+
+            def parse_window(label):
+                if label == "Last 24 / Next 6":
+                    return now - pd.Timedelta(hours=24), now + pd.Timedelta(hours=6)
+                if label == "Last 24 / Next 24":
+                    return now - pd.Timedelta(hours=24), now + pd.Timedelta(hours=24)
+                if label == "Last 12 / Next 6":
+                    return now - pd.Timedelta(hours=12), now + pd.Timedelta(hours=6)
+                if label == "Last 48 / Next 24":
+                    return now - pd.Timedelta(hours=48), now + pd.Timedelta(hours=24)
+                if label == "Last 24":
+                    return now - pd.Timedelta(hours=24), now
+                if label == "Last 48":
+                    return now - pd.Timedelta(hours=48), now
+                if label == "Last 72":
+                    return now - pd.Timedelta(hours=72), now
+                if label == "Last 168":
+                    return now - pd.Timedelta(hours=168), now
+                if label == "Next 24":
+                    return now, now + pd.Timedelta(hours=24)
+                if label == "Next 48":
+                    return now, now + pd.Timedelta(hours=48)
+                if label == "Next 72":
+                    return now, now + pd.Timedelta(hours=72)
+                if label == "Next 168":
+                    return now, now + pd.Timedelta(hours=168)
+                return now - pd.Timedelta(hours=24), now + pd.Timedelta(hours=6)
+
+
+            trader_start, trader_end = parse_window(trader_window)
+            history_start, history_end = parse_window(history_window)
+
+            if np4732_window == "Trader Span":
+                np4732_start, np4732_end = trader_start, trader_end
             else:
-                actual_size = 18000
-                forecast_size = 70000
+                np4732_start, np4732_end = parse_window(np4732_window)
 
-            forecast_posted_start = start_ts - pd.Timedelta(hours=3)
+            if use_exact_trader_range:
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    trader_start_date = st.date_input("Trader start date", value=trader_start.date(),
+                                                      key="wind_trader_start_date_v6")
+                    trader_start_time = st.time_input(
+                        "Trader start time",
+                        value=trader_start.to_pydatetime().time().replace(second=0, microsecond=0),
+                        step=300,
+                        key="wind_trader_start_time_v6"
+                    )
+                with ec2:
+                    trader_end_date = st.date_input("Trader end date", value=trader_end.date(),
+                                                    key="wind_trader_end_date_v6")
+                    trader_end_time = st.time_input(
+                        "Trader end time",
+                        value=trader_end.to_pydatetime().time().replace(second=0, microsecond=0),
+                        step=300,
+                        key="wind_trader_end_time_v6"
+                    )
 
-            actual_posted_from = start_ts.strftime("%Y-%m-%dT%H:%M")
-            actual_posted_to = end_ts.strftime("%Y-%m-%dT%H:%M")
+                trader_start = pd.Timestamp.combine(trader_start_date, trader_start_time).floor("5min")
+                trader_end = pd.Timestamp.combine(trader_end_date, trader_end_time).floor("5min")
 
-            forecast_posted_from = forecast_posted_start.strftime("%Y-%m-%dT%H:%M")
-            forecast_posted_to = end_ts.strftime("%Y-%m-%dT%H:%M")
+                if trader_end <= trader_start:
+                    st.warning("Trader View end time must be later than start time.")
+                    st.stop()
 
-            actual_endpoint, _ = get_artifact_endpoint(ACTUAL_PRODUCT_URL)
-            forecast_endpoint, _ = get_artifact_endpoint(FORECAST_PRODUCT_URL)
-
-            actual_raw = load_report(actual_endpoint, actual_posted_from, actual_posted_to, actual_size)
-            forecast_raw = load_report(forecast_endpoint, forecast_posted_from, forecast_posted_to, forecast_size)
-
-            actual_regional_df, actual_time_col = normalize_actual_regional_df(actual_raw)
-            forecast_long, forecast_posted_col, forecast_target_col = normalize_forecast_long(forecast_raw)
-
-            actual_regional_df = align_index(actual_regional_df, start_ts, end_ts)
-            forecast_long = forecast_long[
-                (forecast_long["target_ts"] >= start_ts) &
-                (forecast_long["target_ts"] <= end_ts)
-                ].copy()
-
-            if actual_regional_df.empty:
-                st.warning("No actual wind data returned for that period.")
+            main_regions = st.multiselect(
+                "Main chart regions",
+                options=["ERCOT Total", "Panhandle", "Coastal", "South", "West", "North"],
+                default=["ERCOT Total"],
+                key="wind_main_regions_v6"
+            )
+            if not main_regions:
+                st.warning("Select at least one main chart region.")
                 st.stop()
 
-            if forecast_long.empty:
-                st.warning("No forecast wind data returned for that period.")
+            layer_row1, layer_row2, layer_row3, layer_row4 = st.columns(4)
+            with layer_row1:
+                show_actual = st.checkbox("Show Actual", value=True, key="wind_show_actual_v6")
+            with layer_row2:
+                show_latest = st.checkbox("Show Latest Intra-hour", value=True, key="wind_show_latest_v6")
+            with layer_row3:
+                show_1h = st.checkbox("Show 1h Ago", value=True, key="wind_show_1h_v6")
+            with layer_row4:
+                show_2h = st.checkbox("Show 2h Ago", value=False, key="wind_show_2h_v6")
+
+            layer_row5, layer_row6, layer_row7 = st.columns(3)
+            with layer_row5:
+                error_metric = st.selectbox(
+                    "Error Metric",
+                    ["MW Error", "Absolute Error", "Percent Error"],
+                    index=0,
+                    key="wind_error_metric_v6"
+                )
+            with layer_row6:
+                include_np4732_in_error = st.checkbox("Include NP4-732 STWPF in error chart", value=True,
+                                                      key="wind_include_np4732_error_v6")
+            with layer_row7:
+                load_np4442 = st.checkbox("Load NP4-442 COP model status", value=False, key="wind_load_np4442_v6")
+
+            st.subheader("NP4-732 Chart Controls")
+            npc1, npc2 = st.columns(2)
+            with npc1:
+                np4732_metric = st.selectbox(
+                    "NP4-732 metric",
+                    options=["STWPF", "WGRPP", "COP HSL", "Actual Gen", "System HSL"],
+                    index=0,
+                    key="wind_np4732_metric_v6"
+                )
+            with npc2:
+                np4732_regions = st.multiselect(
+                    "NP4-732 regions",
+                    options=["ERCOT Total", "South Houston", "West", "North"],
+                    default=["ERCOT Total", "West", "North"],
+                    key="wind_np4732_regions_v6"
+                )
+            if not np4732_regions:
+                st.warning("Select at least one NP4-732 region.")
                 st.stop()
 
-            selected_available_series = [
-                s for s in selected_series
-                if s in actual_regional_df.columns
-                   or s in forecast_long["series"].unique().tolist()
+            show_table = st.checkbox("Show data tables", value=False, key="wind_show_tables_v6")
+
+            selected_leads = ["Latest"]
+            if show_1h:
+                selected_leads.append("1 hour ago")
+            if show_2h:
+                selected_leads.append("2 hour ago")
+
+            lead_map = {
+                "Latest": 0,
+                "1 hour ago": 60,
+                "2 hour ago": 120,
+            }
+
+            st.caption(
+                f"Trader: {trader_start:%Y-%m-%d %H:%M} to {trader_end:%Y-%m-%d %H:%M} | "
+                f"History: {history_start:%Y-%m-%d %H:%M} to {history_end:%Y-%m-%d %H:%M} | "
+                f"NP4-732: {np4732_start:%Y-%m-%d %H:%M} to {np4732_end:%Y-%m-%d %H:%M}"
+            )
+
+            # =====================================================
+            # LOAD FEEDS
+            # =====================================================
+            trader_hours = max((trader_end - trader_start).total_seconds() / 3600.0, 0.0)
+            if trader_hours <= 24:
+                actual_size = 12000
+                intrahour_size = 25000
+            elif trader_hours <= 72:
+                actual_size = 25000
+                intrahour_size = 50000
+            else:
+                actual_size = 40000
+                intrahour_size = 90000
+
+            np4732_size = 1000
+            np4442_size = 15000
+
+            actual_from = min(trader_start, history_start).strftime("%Y-%m-%dT%H:%M")
+            actual_to = max(trader_end, history_end, now).strftime("%Y-%m-%dT%H:%M")
+
+            intrahour_from = (min(trader_start, history_start, now) - pd.Timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M")
+            intrahour_to = max(trader_end, history_end).strftime("%Y-%m-%dT%H:%M")
+
+            actual_res = safe_load_product(
+                ACTUAL_PRODUCT_URL,
+                posted_from=actual_from,
+                posted_to=actual_to,
+                size=actual_size,
+                timeout=60,
+            )
+
+            intrahour_res = safe_load_product(
+                INTRAHOUR_PRODUCT_URL,
+                posted_from=intrahour_from,
+                posted_to=intrahour_to,
+                size=intrahour_size,
+                timeout=60,
+            )
+
+            np4732_res = safe_load_product(
+                NP4732_PRODUCT_URL,
+                posted_from=None,
+                posted_to=None,
+                size=np4732_size,
+                timeout=45,
+            )
+
+            if load_np4442:
+                np4442_res = safe_load_product(
+                    NP4442_PRODUCT_URL,
+                    posted_from=None,
+                    posted_to=None,
+                    size=np4442_size,
+                    timeout=45,
+                )
+            else:
+                np4442_res = {
+                    "ok": False,
+                    "endpoint": None,
+                    "df": pd.DataFrame(),
+                    "error": "NP4-442 not loaded",
+                }
+
+            # =====================================================
+            # NORMALIZE FEEDS
+            # =====================================================
+            actual_df = pd.DataFrame()
+            actual_error = None
+            actual_time_col = None
+            if actual_res["ok"]:
+                try:
+                    actual_df, actual_time_col = normalize_actual_regional_df(actual_res["df"])
+                except Exception as e:
+                    actual_error = str(e)
+            else:
+                actual_error = actual_res["error"]
+
+            intrahour_long = pd.DataFrame()
+            intrahour_error = None
+            intrahour_posted_col = None
+            intrahour_target_col = None
+            if intrahour_res["ok"]:
+                try:
+                    intrahour_long, intrahour_posted_col, intrahour_target_col = normalize_intrahour_forecast_long(
+                        intrahour_res["df"])
+                except Exception as e:
+                    intrahour_error = str(e)
+            else:
+                intrahour_error = intrahour_res["error"]
+
+            np4732_long = pd.DataFrame()
+            np4732_wide = pd.DataFrame()
+            np4732_error = None
+            if np4732_res["ok"]:
+                try:
+                    np4732_long, np4732_wide = normalize_np4732_hourly(np4732_res["df"])
+                except Exception as e:
+                    np4732_error = str(e)
+            else:
+                np4732_error = np4732_res["error"]
+
+            cop_status_df = pd.DataFrame()
+            cop_posted_col = None
+            np4442_error = None
+            if np4442_res["ok"]:
+                try:
+                    cop_status_df, cop_posted_col = parse_np4442_cop_model_status(np4442_res["df"])
+                except Exception as e:
+                    np4442_error = str(e)
+            else:
+                np4442_error = np4442_res["error"]
+
+            actual_trader = align_index(actual_df, trader_start, trader_end) if not actual_df.empty else pd.DataFrame()
+            actual_history = align_index(actual_df, history_start,
+                                         history_end) if not actual_df.empty else pd.DataFrame()
+
+            if not intrahour_long.empty:
+                intrahour_trader_long = intrahour_long[
+                    (intrahour_long["target_ts"] >= trader_start) &
+                    (intrahour_long["target_ts"] <= trader_end)
+                    ].copy()
+
+                intrahour_history_long = intrahour_long[
+                    (intrahour_long["target_ts"] >= history_start) &
+                    (intrahour_long["target_ts"] <= history_end)
+                    ].copy()
+            else:
+                intrahour_trader_long = pd.DataFrame()
+                intrahour_history_long = pd.DataFrame()
+
+            intrahour_trader_curves = {}
+            intrahour_history_curves = {}
+            for label in selected_leads:
+                if not intrahour_trader_long.empty:
+                    intrahour_trader_curves[label] = align_index(
+                        build_intrahour_lead_curve(intrahour_trader_long, lead_map[label]),
+                        trader_start,
+                        trader_end,
+                    )
+                else:
+                    intrahour_trader_curves[label] = pd.DataFrame()
+
+                if not intrahour_history_long.empty:
+                    intrahour_history_curves[label] = align_index(
+                        build_intrahour_lead_curve(intrahour_history_long, lead_map[label]),
+                        history_start,
+                        history_end,
+                    )
+                else:
+                    intrahour_history_curves[label] = pd.DataFrame()
+
+            if not np4732_wide.empty:
+                np4732_chart = align_index(np4732_wide, np4732_start, np4732_end)
+                np4732_history = align_index(np4732_wide, history_start, history_end)
+            else:
+                np4732_chart = pd.DataFrame()
+                np4732_history = pd.DataFrame()
+
+            available_main_series = [
+                s for s in main_regions
+                if s in actual_df.columns
+                   or any((not c.empty and s in c.columns) for c in intrahour_trader_curves.values())
                    or s == "ERCOT Total"
             ]
-
-            if not selected_available_series:
-                st.warning("Selected series were not found in the returned data.")
+            if not available_main_series:
+                st.warning("No selected main chart regions were found in the returned data.")
                 st.stop()
 
-            forecast_curves = {}
-            for lead_label in selected_leads:
-                lead_minutes = lead_options[lead_label]
-                curve = build_lead_curve(forecast_long, lead_minutes, available_series)
-                curve = align_index(curve, start_ts, end_ts)
-                forecast_curves[lead_label] = curve
+            colors = px.colors.qualitative.Plotly
+            color_map = {r: colors[i % len(colors)] for i, r in enumerate(main_region_order())}
+            np4732_color_map = {
+                "ERCOT Total": colors[0],
+                "South Houston": colors[1],
+                "West": colors[2],
+                "North": colors[3],
+            }
 
-            st.subheader("Wind Trader Graph")
-            st.caption("Use the multiselect to declutter. You can also click legend items to hide/show traces.")
+            # =====================================================
+            # STATUS STRIP
+            # =====================================================
+            st.subheader("Status")
 
-            palette = px.colors.qualitative.Plotly
-            color_map = {series: palette[i % len(palette)] for i, series in enumerate(available_series)}
+            s1, s2, s3 = st.columns(3)
 
-            fig = go.Figure()
+            with s1:
+                if not actual_trader.empty and "ERCOT Total" in actual_trader.columns and actual_trader[
+                    "ERCOT Total"].dropna().any():
+                    val = actual_trader["ERCOT Total"].dropna().iloc[-1]
+                    ts = actual_trader["ERCOT Total"].dropna().index[-1]
+                    st.metric("Latest Actual", f"{val:,.0f} MW", help=f"As of {ts:%Y-%m-%d %H:%M}")
+                else:
+                    st.metric("Latest Actual", "n/a")
 
-            if view_mode == "Actual vs Forecast":
-                for series_name in selected_available_series:
-                    if series_name in actual_regional_df.columns:
-                        fig.add_trace(
+            with s2:
+                latest_curve = intrahour_trader_curves.get("Latest", pd.DataFrame())
+                if not latest_curve.empty and "ERCOT Total" in latest_curve.columns and latest_curve[
+                    "ERCOT Total"].dropna().any():
+                    val = latest_curve["ERCOT Total"].dropna().iloc[-1]
+                    ts = latest_curve["ERCOT Total"].dropna().index[-1]
+                    st.metric("Latest Intra-hour", f"{val:,.0f} MW", help=f"Target {ts:%Y-%m-%d %H:%M}")
+                else:
+                    st.metric("Latest Intra-hour", "n/a")
+
+            with s3:
+                selected_metric_for_status = ("STWPF", "ERCOT Total")
+                if not np4732_chart.empty and selected_metric_for_status in np4732_chart.columns and np4732_chart[
+                    selected_metric_for_status].dropna().any():
+                    val = np4732_chart[selected_metric_for_status].dropna().iloc[0]
+                    ts = np4732_chart[selected_metric_for_status].dropna().index[0]
+                    st.metric("NP4-732 STWPF", f"{val:,.0f} MW", help=f"First target {ts:%Y-%m-%d %H:%M}")
+                else:
+                    st.metric("NP4-732 STWPF", "n/a")
+
+            if load_np4442:
+                st.subheader("COP Model Status (NP4-442)")
+                if not cop_status_df.empty:
+                    st.dataframe(cop_status_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("COP model status not available from NP4-442 for this load.")
+
+            # =====================================================
+            # CHART 1 - MAIN TRADER VIEW
+            # =====================================================
+            st.subheader("Trader View: Recent + Near-Term")
+
+            trader_fig = build_base_figure(height=720, yaxis_title="MW")
+            trader_has_data = False
+
+            for r in available_main_series:
+                if show_actual and not actual_trader.empty and r in actual_trader.columns:
+                    x = actual_trader[r].dropna()
+                    if not x.empty:
+                        trader_has_data = True
+                        trader_fig.add_trace(
                             go.Scatter(
-                                x=actual_regional_df.index,
-                                y=actual_regional_df[series_name],
-                                mode="lines",
-                                name=f"{series_name} Actual",
-                                line=dict(color=color_map[series_name], dash="solid"),
-                                hovertemplate=(
-                                    f"Series: {series_name} Actual<br>"
-                                    "Time: %{x}<br>"
-                                    "MW: %{y:,.0f}<extra></extra>"
-                                ),
+                                x=x.index,
+                                y=x.values,
+                                name=f"{r} Actual",
+                                line=dict(color=color_map[r], width=2),
+                                hovertemplate=f"{r} Actual<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
                             )
                         )
 
-                    for lead_label in selected_leads:
-                        curve = forecast_curves.get(lead_label, pd.DataFrame())
-                        if not curve.empty and series_name in curve.columns:
-                            dash_style = {
-                                "Latest": "dash",
-                                "1 hour ago": "dot",
-                                "2 hours ago": "dashdot",
-                            }.get(lead_label, "dash")
-
-                            fig.add_trace(
+                if show_latest:
+                    latest_curve = intrahour_trader_curves.get("Latest", pd.DataFrame())
+                    if not latest_curve.empty and r in latest_curve.columns:
+                        x = latest_curve[r].dropna()
+                        if not x.empty:
+                            trader_has_data = True
+                            trader_fig.add_trace(
                                 go.Scatter(
-                                    x=curve.index,
-                                    y=curve[series_name],
-                                    mode="lines",
-                                    name=f"{series_name} Forecast {lead_label}",
-                                    line=dict(color=color_map[series_name], dash=dash_style),
-                                    hovertemplate=(
-                                        f"Series: {series_name} Forecast {lead_label}<br>"
-                                        "Time: %{x}<br>"
-                                        "MW: %{y:,.0f}<extra></extra>"
-                                    ),
+                                    x=x.index,
+                                    y=x.values,
+                                    name=f"{r} Latest",
+                                    line=dict(color=color_map[r], dash="dash"),
+                                    hovertemplate=f"{r} Latest<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
                                 )
                             )
 
-                fig.update_layout(
-                    xaxis_title="Time",
-                    yaxis_title="MW",
-                    hovermode="x unified",
-                    legend_title_text="Series",
-                    height=700,
-                    margin=dict(l=20, r=20, t=20, b=20),
-                )
-
-            elif view_mode == "Forecast Error":
-                for series_name in selected_available_series:
-                    if series_name not in actual_regional_df.columns:
-                        continue
-
-                    for lead_label in selected_leads:
-                        curve = forecast_curves.get(lead_label, pd.DataFrame())
-                        if curve.empty or series_name not in curve.columns:
-                            continue
-
-                        combined = pd.concat(
-                            [
-                                actual_regional_df[[series_name]].rename(columns={series_name: "actual"}),
-                                curve[[series_name]].rename(columns={series_name: "forecast"})
-                            ],
-                            axis=1
-                        )
-                        combined["error"] = combined["forecast"] - combined["actual"]
-
-                        dash_style = {
-                            "Latest": "dash",
-                            "1 hour ago": "dot",
-                            "2 hours ago": "dashdot",
-                        }.get(lead_label, "dash")
-
-                        fig.add_trace(
-                            go.Scatter(
-                                x=combined.index,
-                                y=combined["error"],
-                                mode="lines",
-                                name=f"{series_name} Error {lead_label}",
-                                line=dict(color=color_map[series_name], dash=dash_style),
-                                hovertemplate=(
-                                    f"Series: {series_name} Error {lead_label}<br>"
-                                    "Time: %{x}<br>"
-                                    "Forecast - Actual: %{y:,.0f} MW<extra></extra>"
-                                ),
+                if show_1h:
+                    curve_1h = intrahour_trader_curves.get("1 hour ago", pd.DataFrame())
+                    if not curve_1h.empty and r in curve_1h.columns:
+                        x = curve_1h[r].dropna()
+                        if not x.empty:
+                            trader_has_data = True
+                            trader_fig.add_trace(
+                                go.Scatter(
+                                    x=x.index,
+                                    y=x.values,
+                                    name=f"{r} 1h Ago",
+                                    line=dict(color=color_map[r], dash="dot"),
+                                    hovertemplate=f"{r} 1h Ago<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
+                                )
                             )
-                        )
 
-                fig.update_layout(
-                    xaxis_title="Time",
-                    yaxis_title="Forecast - Actual (MW)",
-                    hovermode="x unified",
-                    legend_title_text="Series",
-                    height=700,
-                    margin=dict(l=20, r=20, t=20, b=20),
-                )
-                fig.add_hline(y=0, line_dash="solid", line_width=1)
-
-            else:
-                latest_curve = forecast_curves.get("Latest", pd.DataFrame())
-                older_labels = [x for x in selected_leads if x != "Latest"]
-
-                if latest_curve.empty:
-                    st.warning("Forecast Revisions mode needs 'Latest' selected.")
-                    st.stop()
-
-                if not older_labels:
-                    st.warning("Forecast Revisions mode needs 'Latest' plus at least one older forecast line.")
-                    st.stop()
-
-                for series_name in selected_available_series:
-                    if series_name not in latest_curve.columns:
-                        continue
-
-                    for older_label in older_labels:
-                        older_curve = forecast_curves.get(older_label, pd.DataFrame())
-                        if older_curve.empty or series_name not in older_curve.columns:
-                            continue
-
-                        combined = pd.concat(
-                            [
-                                latest_curve[[series_name]].rename(columns={series_name: "latest"}),
-                                older_curve[[series_name]].rename(columns={series_name: "older"})
-                            ],
-                            axis=1
-                        )
-                        combined["revision"] = combined["latest"] - combined["older"]
-
-                        dash_style = {
-                            "1 hour ago": "dot",
-                            "2 hours ago": "dashdot",
-                        }.get(older_label, "dot")
-
-                        fig.add_trace(
-                            go.Scatter(
-                                x=combined.index,
-                                y=combined["revision"],
-                                mode="lines",
-                                name=f"{series_name} Revision vs {older_label}",
-                                line=dict(color=color_map[series_name], dash=dash_style),
-                                hovertemplate=(
-                                    f"Series: {series_name} Revision vs {older_label}<br>"
-                                    "Time: %{x}<br>"
-                                    "Latest - Older: %{y:,.0f} MW<extra></extra>"
-                                ),
+                if show_2h:
+                    curve_2h = intrahour_trader_curves.get("2 hour ago", pd.DataFrame())
+                    if not curve_2h.empty and r in curve_2h.columns:
+                        x = curve_2h[r].dropna()
+                        if not x.empty:
+                            trader_has_data = True
+                            trader_fig.add_trace(
+                                go.Scatter(
+                                    x=x.index,
+                                    y=x.values,
+                                    name=f"{r} 2h Ago",
+                                    line=dict(color=color_map[r], dash="dashdot"),
+                                    hovertemplate=f"{r} 2h Ago<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
+                                )
                             )
-                        )
 
-                fig.update_layout(
-                    xaxis_title="Time",
-                    yaxis_title="Latest Forecast - Older Forecast (MW)",
-                    hovermode="x unified",
-                    legend_title_text="Series",
-                    height=700,
-                    margin=dict(l=20, r=20, t=20, b=20),
-                )
-                fig.add_hline(y=0, line_dash="solid", line_width=1)
-
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                key="wind_trader_chart"
-            )
-
-            export_df = pd.DataFrame(index=actual_regional_df.index)
-
-            if view_mode == "Actual vs Forecast":
-                for series_name in selected_available_series:
-                    if series_name in actual_regional_df.columns:
-                        export_df[f"{series_name} Actual"] = actual_regional_df[series_name]
-                    for lead_label in selected_leads:
-                        curve = forecast_curves.get(lead_label, pd.DataFrame())
-                        if not curve.empty and series_name in curve.columns:
-                            export_df[f"{series_name} Forecast {lead_label}"] = curve[series_name]
-
-            elif view_mode == "Forecast Error":
-                for series_name in selected_available_series:
-                    if series_name not in actual_regional_df.columns:
-                        continue
-                    for lead_label in selected_leads:
-                        curve = forecast_curves.get(lead_label, pd.DataFrame())
-                        if curve.empty or series_name not in curve.columns:
-                            continue
-                        combined = pd.concat(
-                            [
-                                actual_regional_df[[series_name]].rename(columns={series_name: "actual"}),
-                                curve[[series_name]].rename(columns={series_name: "forecast"})
-                            ],
-                            axis=1
-                        )
-                        export_df[f"{series_name} Error {lead_label}"] = combined["forecast"] - combined["actual"]
-
+            if trader_has_data:
+                st.plotly_chart(trader_fig, use_container_width=True, key="wind_trader_chart_v6")
             else:
-                latest_curve = forecast_curves.get("Latest", pd.DataFrame())
-                for series_name in selected_available_series:
-                    if latest_curve.empty or series_name not in latest_curve.columns:
-                        continue
-                    for older_label in [x for x in selected_leads if x != "Latest"]:
-                        older_curve = forecast_curves.get(older_label, pd.DataFrame())
-                        if older_curve.empty or series_name not in older_curve.columns:
-                            continue
+                st.info("No trader-view data available for the selected window.")
+
+            # =====================================================
+            # CHART 2 - NP4-732 SEPARATE CHART
+            # =====================================================
+            st.subheader("NP4-732 Hourly Outlook")
+
+            np4732_fig = build_base_figure(height=500, yaxis_title="MW")
+            np4732_has_data = False
+
+            metric_name_map = {
+                "STWPF": "STWPF",
+                "WGRPP": "WGRPP",
+                "COP HSL": "COP HSL",
+                "Actual Gen": "Actual Gen",
+                "System HSL": "System HSL",
+            }
+
+            selected_metric = metric_name_map[np4732_metric]
+
+            if not np4732_chart.empty:
+                for region in np4732_regions:
+                    col_key = (selected_metric, region)
+                    if col_key in np4732_chart.columns:
+                        series = np4732_chart[col_key].dropna()
+                        if not series.empty:
+                            np4732_has_data = True
+                            np4732_fig.add_trace(
+                                go.Scatter(
+                                    x=series.index,
+                                    y=series.values,
+                                    mode="lines",
+                                    name=f"{region} {selected_metric}",
+                                    line=dict(color=np4732_color_map.get(region)),
+                                    hovertemplate=f"{region} {selected_metric}<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
+                                )
+                            )
+
+            if np4732_has_data:
+                st.plotly_chart(np4732_fig, use_container_width=True, key="wind_np4732_chart_v6")
+            else:
+                st.info("No NP4-732 data available for the selected metric / regions / window.")
+
+            # =====================================================
+            # CHART 3 - HISTORICAL ERROR
+            # =====================================================
+            st.subheader("Historical Forecast Error")
+
+            metric_map = {
+                "MW Error": "error_mw",
+                "Absolute Error": "abs_error_mw",
+                "Percent Error": "pct_error",
+            }
+            y_col = metric_map.get(error_metric, "error_mw")
+            y_title = {
+                "error_mw": "Forecast - Actual (MW)",
+                "abs_error_mw": "Absolute Error (MW)",
+                "pct_error": "Forecast Error (%)",
+            }[y_col]
+
+            error_fig = build_base_figure(height=420, yaxis_title=y_title)
+            error_has_data = False
+
+            for r in available_main_series:
+                if not actual_history.empty and r in actual_history.columns:
+                    if show_latest:
+                        latest_hist = intrahour_history_curves.get("Latest", pd.DataFrame())
+                        if not latest_hist.empty and r in latest_hist.columns:
+                            err = make_error_frame(actual_history[r], latest_hist[r])
+                            if not err.empty and y_col in err.columns:
+                                error_has_data = True
+                                error_fig.add_trace(
+                                    go.Scatter(
+                                        x=err.index,
+                                        y=err[y_col],
+                                        name=f"{r} Latest Error",
+                                        line=dict(color=color_map[r], dash="dash"),
+                                        hovertemplate=f"{r} Latest Error<br>%{{x}}<br>%{{y}}<extra></extra>",
+                                    )
+                                )
+
+                    if include_np4732_in_error:
+                        stwpf_key = ("STWPF", r)
+                        if not np4732_history.empty and stwpf_key in np4732_history.columns:
+                            err = make_error_frame(actual_history[r], np4732_history[stwpf_key])
+                            if not err.empty and y_col in err.columns:
+                                error_has_data = True
+                                error_fig.add_trace(
+                                    go.Scatter(
+                                        x=err.index,
+                                        y=err[y_col],
+                                        name=f"{r} NP4-732 STWPF Error",
+                                        line=dict(color=color_map[r], dash="longdash"),
+                                        hovertemplate=f"{r} NP4-732 STWPF Error<br>%{{x}}<br>%{{y}}<extra></extra>",
+                                    )
+                                )
+
+            if error_has_data:
+                if y_col != "abs_error_mw":
+                    error_fig.add_hline(y=0, line_dash="solid", line_width=1)
+                st.plotly_chart(error_fig, use_container_width=True, key="wind_error_chart_v6")
+            else:
+                st.info("No overlapping actual / forecast history exists for the selected error window.")
+
+            # =====================================================
+            # CHART 4 - HISTORICAL REVISIONS
+            # =====================================================
+            st.subheader("Historical Forecast Revisions")
+
+            revision_fig = build_base_figure(height=420, yaxis_title="Latest - Older Forecast (MW)")
+            revision_has_data = False
+
+            latest_hist = intrahour_history_curves.get("Latest", pd.DataFrame())
+            curve_1h = intrahour_history_curves.get("1 hour ago", pd.DataFrame())
+            curve_2h = intrahour_history_curves.get("2 hour ago", pd.DataFrame())
+
+            for r in available_main_series:
+                if not latest_hist.empty and r in latest_hist.columns:
+                    if show_1h and not curve_1h.empty and r in curve_1h.columns:
                         combined = pd.concat(
                             [
-                                latest_curve[[series_name]].rename(columns={series_name: "latest"}),
-                                older_curve[[series_name]].rename(columns={series_name: "older"})
+                                latest_hist[[r]].rename(columns={r: "latest"}),
+                                curve_1h[[r]].rename(columns={r: "older"})
                             ],
                             axis=1
-                        )
-                        export_df[f"{series_name} Revision vs {older_label}"] = combined["latest"] - combined["older"]
+                        ).dropna()
 
-            csv = export_df.reset_index().to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download graphed data as CSV",
-                data=csv,
-                file_name="ercot_wind_trader_view.csv",
-                mime="text/csv",
-                key="wind_trader_download"
-            )
+                        if not combined.empty:
+                            revision_has_data = True
+                            combined["revision"] = combined["latest"] - combined["older"]
+                            revision_fig.add_trace(
+                                go.Scatter(
+                                    x=combined.index,
+                                    y=combined["revision"],
+                                    name=f"{r} Revision vs 1h Ago",
+                                    line=dict(color=color_map[r], dash="dot"),
+                                    hovertemplate=f"{r} Revision vs 1h Ago<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
+                                )
+                            )
 
-            with st.expander("Show graphed data"):
-                st.dataframe(
-                    export_df.reset_index(),
-                    use_container_width=True,
-                    hide_index=True
-                )
+                    if show_2h and not curve_2h.empty and r in curve_2h.columns:
+                        combined = pd.concat(
+                            [
+                                latest_hist[[r]].rename(columns={r: "latest"}),
+                                curve_2h[[r]].rename(columns={r: "older"})
+                            ],
+                            axis=1
+                        ).dropna()
 
+                        if not combined.empty:
+                            revision_has_data = True
+                            combined["revision"] = combined["latest"] - combined["older"]
+                            revision_fig.add_trace(
+                                go.Scatter(
+                                    x=combined.index,
+                                    y=combined["revision"],
+                                    name=f"{r} Revision vs 2h Ago",
+                                    line=dict(color=color_map[r], dash="dashdot"),
+                                    hovertemplate=f"{r} Revision vs 2h Ago<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
+                                )
+                            )
+
+            if revision_has_data:
+                revision_fig.add_hline(y=0, line_dash="solid", line_width=1)
+                st.plotly_chart(revision_fig, use_container_width=True, key="wind_revision_chart_v6")
+            else:
+                st.info("No revision overlap exists for the selected history window.")
+
+            # =====================================================
+            # DATA TABLES
+            # =====================================================
+            if show_table:
+                st.subheader("Data Tables")
+
+                trader_table = pd.DataFrame(index=actual_trader.index if not actual_trader.empty else pd.Index([]))
+                for r in available_main_series:
+                    if show_actual and not actual_trader.empty and r in actual_trader.columns:
+                        trader_table[f"{r} Actual"] = actual_trader[r]
+
+                    if show_latest:
+                        latest_curve = intrahour_trader_curves.get("Latest", pd.DataFrame())
+                        if not latest_curve.empty and r in latest_curve.columns:
+                            trader_table[f"{r} Latest"] = latest_curve[r]
+
+                    if show_1h:
+                        curve_1h = intrahour_trader_curves.get("1 hour ago", pd.DataFrame())
+                        if not curve_1h.empty and r in curve_1h.columns:
+                            trader_table[f"{r} 1h Ago"] = curve_1h[r]
+
+                    if show_2h:
+                        curve_2h = intrahour_trader_curves.get("2 hour ago", pd.DataFrame())
+                        if not curve_2h.empty and r in curve_2h.columns:
+                            trader_table[f"{r} 2h Ago"] = curve_2h[r]
+
+                np4732_table = pd.DataFrame(index=np4732_chart.index if not np4732_chart.empty else pd.Index([]))
+                for region in np4732_regions:
+                    col_key = (selected_metric, region)
+                    if not np4732_chart.empty and col_key in np4732_chart.columns:
+                        np4732_table[f"{region} {selected_metric}"] = np4732_chart[col_key]
+
+                st.markdown("**Main Trader Data**")
+                st.dataframe(trader_table.reset_index(), use_container_width=True, hide_index=True)
+
+                st.markdown("**NP4-732 Data**")
+                st.dataframe(np4732_table.reset_index(), use_container_width=True, hide_index=True)
+
+                trader_csv = trader_table.reset_index().to_csv(index=False).encode("utf-8")
+                np4732_csv = np4732_table.reset_index().to_csv(index=False).encode("utf-8")
+
+                d1, d2 = st.columns(2)
+                with d1:
+                    st.download_button(
+                        "Download trader data CSV",
+                        data=trader_csv,
+                        file_name="ercot_wind_trader_main.csv",
+                        mime="text/csv",
+                        key="wind_trader_main_download_v6"
+                    )
+                with d2:
+                    st.download_button(
+                        "Download NP4-732 data CSV",
+                        data=np4732_csv,
+                        file_name="ercot_wind_np4732.csv",
+                        mime="text/csv",
+                        key="wind_trader_np4732_download_v6"
+                    )
+
+    # =====================================================
+    # DEBUG
+    # =====================================================
             with st.expander("Debug info"):
-                st.write(f"Actual endpoint: {actual_endpoint}")
-                st.write(f"Forecast endpoint: {forecast_endpoint}")
-                st.write(f"Actual rows returned: {len(actual_raw):,}")
-                st.write(f"Forecast rows returned: {len(forecast_raw):,}")
-                st.write(f"Actual timestamp column: {actual_time_col}")
-                st.write(f"Forecast posted column: {forecast_posted_col}")
-                st.write(f"Forecast target column: {forecast_target_col}")
-                st.write("Forecast columns:")
-                st.write(list(forecast_raw.columns))
+                st.write("Feed status:")
+                st.write({
+                    "actual_ok": actual_res["ok"],
+                    "intrahour_ok": intrahour_res["ok"],
+                    "np4732_ok": np4732_res["ok"],
+                    "np4442_ok": np4442_res["ok"],
+                })
+
+                if actual_res["endpoint"]:
+                    st.write(f"Actual endpoint: {actual_res['endpoint']}")
+                if intrahour_res["endpoint"]:
+                    st.write(f"Intra-hour endpoint: {intrahour_res['endpoint']}")
+                if np4732_res["endpoint"]:
+                    st.write(f"NP4-732 endpoint: {np4732_res['endpoint']}")
+                if np4442_res["endpoint"]:
+                    st.write(f"NP4-442 endpoint: {np4442_res['endpoint']}")
+
+                if actual_error:
+                    st.write(f"Actual parse/load error: {actual_error}")
+                if intrahour_error:
+                    st.write(f"Intra-hour parse/load error: {intrahour_error}")
+                if np4732_error:
+                    st.write(f"NP4-732 parse/load error: {np4732_error}")
+                if np4442_error:
+                    st.write(f"NP4-442 parse/load error: {np4442_error}")
+
+                if actual_res["ok"]:
+                    st.write("Actual columns:")
+                    st.write(list(actual_res["df"].columns))
+                if intrahour_res["ok"]:
+                    st.write("Intra-hour columns:")
+                    st.write(list(intrahour_res["df"].columns))
+                if np4732_res["ok"]:
+                    st.write("NP4-732 columns:")
+                    st.write(list(np4732_res["df"].columns))
+                if np4442_res["ok"]:
+                    st.write("NP4-442 columns:")
+                    st.write(list(np4442_res["df"].columns))
 
         except Exception as e:
             st.error(str(e))
-        # -----------------------------
-        # TAB 3 - SOLAR DATA
-        # -----------------------------
+# -----------------------------
+# TAB 3 - SOLAR DATA
+# -----------------------------
 elif page == "Solar Trader View":
-    st.caption("ERCOT Solar Trader View - Actuals, Forecast Errors, Revisions, and 168-Hour Outlook")
+    st.caption("ERCOT Solar Trader View")
 
-    ACTUAL_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-746-cd"
-    INTRAHOUR_FORECAST_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-752-cd"
-    HOURLY_FORECAST_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-443-cd"
+    ACTUAL_5MIN_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-746-cd"
+    HOURLY_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-745-cd"
+    MODEL_STATUS_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np4-443-cd"
 
-    # ---------------------------------------------------
-    # PRODUCT / ARTIFACT HELPERS
-    # ---------------------------------------------------
+    # =====================================================
+    # API HELPERS
+    # =====================================================
     @st.cache_data(ttl=300)
     def get_product_metadata(product_url: str) -> dict:
         r = requests.get(product_url, headers=get_headers(), timeout=60)
@@ -1341,7 +1951,7 @@ elif page == "Solar Trader View":
             if endpoint:
                 score += 1
             if "csv" in blob:
-                score += 5
+                score += 10
             if "xml" in blob:
                 score -= 1
             if "zip" in blob:
@@ -1356,8 +1966,8 @@ elif page == "Solar Trader View":
 
     @st.cache_data(ttl=300)
     def get_artifact_endpoint(product_url: str):
-        product = get_product_metadata(product_url)
-        artifacts = product.get("artifacts", [])
+        meta = get_product_metadata(product_url)
+        artifacts = meta.get("artifacts", [])
         if not artifacts:
             raise ValueError(f"No artifacts found for product: {product_url}")
 
@@ -1366,20 +1976,29 @@ elif page == "Solar Trader View":
         if not endpoint:
             raise ValueError(f"Could not find artifact endpoint for product: {product_url}")
 
-        return endpoint, artifacts
+        return endpoint
 
     @st.cache_data(ttl=300)
-    def load_report(endpoint: str, posted_from=None, posted_to=None, size=10000):
+    def load_report(endpoint: str, posted_from=None, posted_to=None, size=10000, timeout=60):
         params = {"size": size}
         if posted_from:
             params["postedDatetimeFrom"] = posted_from
         if posted_to:
             params["postedDatetimeTo"] = posted_to
 
-        r = requests.get(endpoint, headers=get_headers(), params=params, timeout=120)
-        r.raise_for_status()
-        payload = r.json()
+        session = requests.Session()
+        retries = Retry(
+            total=2,
+            backoff_factor=1.0,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        session.mount("https://", HTTPAdapter(max_retries=retries))
 
+        r = session.get(endpoint, headers=get_headers(), params=params, timeout=timeout)
+        r.raise_for_status()
+
+        payload = r.json()
         fields = payload.get("fields", [])
         rows = payload.get("data", [])
 
@@ -1389,430 +2008,60 @@ elif page == "Solar Trader View":
         cols = [f["name"] for f in fields]
         return pd.DataFrame(rows, columns=cols)
 
-    # ---------------------------------------------------
-    # DETECTION HELPERS
-    # ---------------------------------------------------
-    def detect_time_col(df: pd.DataFrame) -> str | None:
-        preferred = ["intervalEnding", "timestamp", "datetime", "postedDatetime"]
-        for c in preferred:
-            if c in df.columns:
-                return c
+    def safe_load_product(product_url: str, posted_from=None, posted_to=None, size=10000, timeout=60):
+        try:
+            endpoint = get_artifact_endpoint(product_url)
+            df = load_report(endpoint, posted_from=posted_from, posted_to=posted_to, size=size, timeout=timeout)
+            return {
+                "ok": True,
+                "endpoint": endpoint,
+                "df": df,
+                "error": None,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "endpoint": None,
+                "df": pd.DataFrame(),
+                "error": str(e),
+            }
 
-        for c in df.columns:
-            cl = c.lower()
-            if "interval" in cl and "ending" in cl:
-                return c
-        for c in df.columns:
-            cl = c.lower()
-            if "timestamp" in cl or "datetime" in cl or ("time" in cl and "posted" not in cl):
-                return c
+    # =====================================================
+    # GENERIC HELPERS
+    # =====================================================
+    def normalize_key(s: str) -> str:
+        return str(s).strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+
+    def pick_col(df: pd.DataFrame, candidates):
+        lower_map = {normalize_key(c): c for c in df.columns}
+        for cand in candidates:
+            key = normalize_key(cand)
+            if key in lower_map:
+                return lower_map[key]
         return None
-
-    def detect_posted_col(df: pd.DataFrame) -> str | None:
-        preferred = ["postedDatetime", "postedTime", "publishTime", "issueTime", "createdDatetime"]
-        for c in preferred:
-            if c in df.columns:
-                return c
-
-        for c in df.columns:
-            cl = c.lower()
-            if "posted" in cl or "publish" in cl or "issue" in cl or "created" in cl:
-                return c
-        return None
-
-    def detect_target_col(df: pd.DataFrame, posted_col: str | None) -> str | None:
-        preferred = ["intervalEnding", "forecastTime", "deliveryTime", "deliveryDatetime", "timestamp", "datetime"]
-        for c in preferred:
-            if c in df.columns and c != posted_col:
-                return c
-
-        for c in df.columns:
-            if c == posted_col:
-                continue
-            cl = c.lower()
-            if "interval" in cl and "ending" in cl:
-                return c
-        for c in df.columns:
-            if c == posted_col:
-                continue
-            cl = c.lower()
-            if "forecast" in cl and "time" in cl:
-                return c
-        for c in df.columns:
-            if c == posted_col:
-                continue
-            cl = c.lower()
-            if "delivery" in cl and ("time" in cl or "date" in cl):
-                return c
-        for c in df.columns:
-            if c == posted_col:
-                continue
-            cl = c.lower()
-            if "time" in cl or "date" in cl or "timestamp" in cl or "datetime" in cl:
-                return c
-        return None
-
-    # ---------------------------------------------------
-    # SOLAR REGION HELPERS
-    # ---------------------------------------------------
-    def solar_region_order():
-        return [
-            "ERCOT Total",
-            "Center West",
-            "North West",
-            "Far West",
-            "Far East",
-            "South East",
-            "Center East",
-        ]
-
-    def build_solar_region_aliases():
-        return {
-            "centerwest": "Center West",
-            "northwest": "North West",
-            "farwest": "Far West",
-            "fareast": "Far East",
-            "southeast": "South East",
-            "centereast": "Center East",
-            "systemwide": "ERCOT Total",
-            "systemtotal": "ERCOT Total",
-            "system_total": "ERCOT Total",
-        }
-
-    def normalize_region_name(x):
-        if pd.isna(x):
-            return None
-        s = str(x).strip().lower()
-        s_norm = s.replace("_", "").replace("-", "").replace(" ", "")
-        aliases = build_solar_region_aliases()
-        for alias, display in aliases.items():
-            if s_norm == alias or alias in s_norm:
-                return display
-        return None
-
-    def find_solar_wide_region_columns(df: pd.DataFrame):
-        aliases = build_solar_region_aliases()
-        found = {}
-
-        for col in df.columns:
-            lc = col.lower()
-            norm = lc.replace("_", "").replace("-", "").replace(" ", "")
-            for alias, display in aliases.items():
-                if alias in norm:
-                    found[display] = col
-
-        return found
-
-    def find_long_region_and_value_columns(df: pd.DataFrame):
-        region_col = None
-        value_col = None
-
-        region_candidates = []
-        for c in df.columns:
-            cl = c.lower()
-            if "region" in cl or "zone" in cl or "geograph" in cl:
-                region_candidates.append(c)
-
-        value_candidates = []
-        for c in df.columns:
-            cl = c.lower()
-            if any(x in cl for x in ["mw", "gen", "actual", "forecast", "output", "production", "value", "hsl"]):
-                numeric_test = pd.to_numeric(df[c], errors="coerce")
-                if numeric_test.notna().sum() > 0:
-                    value_candidates.append(c)
-
-        if region_candidates:
-            region_col = region_candidates[0]
-        if value_candidates:
-            value_col = value_candidates[0]
-
-        return region_col, value_col
-
-    # ---------------------------------------------------
-    # ACTUAL NORMALIZATION
-    # ---------------------------------------------------
-    def normalize_actual_regional_df(df: pd.DataFrame):
-        df = convert_columns(df.copy())
-
-        time_col = detect_time_col(df)
-        if not time_col:
-            raise ValueError(f"Actuals: Could not detect timestamp column. Columns: {list(df.columns)}")
-
-        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
-        df = df.dropna(subset=[time_col]).copy()
-
-        wide_cols = find_solar_wide_region_columns(df)
-        if wide_cols:
-            out = df[[time_col] + list(wide_cols.values())].copy()
-            out = out.rename(columns={v: k for k, v in wide_cols.items()})
-
-            for c in out.columns:
-                if c != time_col:
-                    out[c] = pd.to_numeric(out[c], errors="coerce")
-
-            out = (
-                out.sort_values(time_col)
-                .drop_duplicates(subset=[time_col], keep="last")
-                .set_index(time_col)
-                .resample("5min")
-                .mean()
-            )
-
-            regional_components = [
-                c for c in ["Center West", "North West", "Far West", "Far East", "South East", "Center East"]
-                if c in out.columns
-            ]
-
-            if "ERCOT Total" not in out.columns and regional_components:
-                out["ERCOT Total"] = out[regional_components].sum(axis=1, min_count=1)
-
-            ordered = [c for c in solar_region_order() if c in out.columns]
-            return out[ordered], time_col
-
-        region_col, value_col = find_long_region_and_value_columns(df)
-        if region_col and value_col:
-            temp = df[[time_col, region_col, value_col]].copy()
-            temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
-            temp = temp.dropna(subset=[value_col]).copy()
-            temp["series"] = temp[region_col].map(normalize_region_name)
-            temp = temp.dropna(subset=["series"]).copy()
-
-            out = (
-                temp.pivot_table(
-                    index=time_col,
-                    columns="series",
-                    values=value_col,
-                    aggfunc="mean"
-                )
-                .sort_index()
-                .resample("5min")
-                .mean()
-            )
-
-            regional_components = [
-                c for c in ["Center West", "North West", "Far West", "Far East", "South East", "Center East"]
-                if c in out.columns
-            ]
-
-            if "ERCOT Total" not in out.columns and regional_components:
-                out["ERCOT Total"] = out[regional_components].sum(axis=1, min_count=1)
-
-            ordered = [c for c in solar_region_order() if c in out.columns]
-            return out[ordered], time_col
-
-        raise ValueError(f"Actuals: Could not detect regional actuals format. Columns: {list(df.columns)}")
-
-    # ---------------------------------------------------
-    # INTRAHOUR FORECAST NORMALIZATION
-    # ---------------------------------------------------
-    def normalize_intrahour_forecast_long(df: pd.DataFrame):
-        df = convert_columns(df.copy())
-
-        posted_col = detect_posted_col(df)
-        target_col = detect_target_col(df, posted_col)
-
-        if not posted_col:
-            raise ValueError(f"Intra-hour forecast: Could not detect posted timestamp column. Columns: {list(df.columns)}")
-        if not target_col:
-            raise ValueError(f"Intra-hour forecast: Could not detect target timestamp column. Columns: {list(df.columns)}")
-
-        df[posted_col] = pd.to_datetime(df[posted_col], errors="coerce")
-        df[target_col] = pd.to_datetime(df[target_col], errors="coerce")
-        df = df.dropna(subset=[posted_col, target_col]).copy()
-
-        wide_cols = find_solar_wide_region_columns(df)
-        if wide_cols:
-            keep_cols = [posted_col, target_col] + list(wide_cols.values())
-            out = df[keep_cols].copy()
-            out = out.rename(columns={v: k for k, v in wide_cols.items()})
-
-            region_names = [c for c in solar_region_order() if c in out.columns]
-            for c in region_names:
-                out[c] = pd.to_numeric(out[c], errors="coerce")
-
-            long_df = out.melt(
-                id_vars=[posted_col, target_col],
-                value_vars=region_names,
-                var_name="series",
-                value_name="mw"
-            ).dropna(subset=["mw"])
-
-            long_df = long_df.rename(columns={
-                posted_col: "posted_ts",
-                target_col: "target_ts"
-            })
-
-            long_df["source"] = "Intra-hour"
-            long_df["model"] = "Latest"
-            return long_df, posted_col, target_col
-
-        region_col, value_col = find_long_region_and_value_columns(df)
-        if region_col and value_col:
-            temp = df[[posted_col, target_col, region_col, value_col]].copy()
-            temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
-            temp = temp.dropna(subset=[value_col]).copy()
-            temp["series"] = temp[region_col].map(normalize_region_name)
-            temp = temp.dropna(subset=["series"]).copy()
-
-            temp = temp.rename(columns={
-                posted_col: "posted_ts",
-                target_col: "target_ts",
-                value_col: "mw"
-            })
-
-            temp["source"] = "Intra-hour"
-            temp["model"] = "Latest"
-            return temp[["posted_ts", "target_ts", "series", "mw", "source", "model"]], posted_col, target_col
-
-        raise ValueError(f"Intra-hour forecast: Could not detect regional forecast format. Columns: {list(df.columns)}")
-
-    # ---------------------------------------------------
-    # NP4-443 HOURLY FORECAST NORMALIZATION
-    # ---------------------------------------------------
-    def normalize_np4443_hourly(df: pd.DataFrame):
-        df = df.copy()
-
-        original_cols = list(df.columns)
-        norm_map = {c: c.strip() for c in df.columns}
-        df = df.rename(columns=norm_map)
-
-        lower_to_orig = {c.lower().replace("_", "").replace(" ", ""): c for c in df.columns}
-
-        def pick_col(candidates):
-            for cand in candidates:
-                key = cand.lower().replace("_", "").replace(" ", "")
-                if key in lower_to_orig:
-                    return lower_to_orig[key]
-            return None
-
-        delivery_col = pick_col(["DeliveryDate", "deliveryDate", "OperatingDate", "date"])
-        he_col = pick_col(["HourEnding", "hourEnding", "HE", "hour"])
-        region_col = pick_col(["Region", "region", "WeatherZone", "zone"])
-        value_col = pick_col(["Value", "value", "MW", "mw", "Forecast", "forecast"])
-        model_col = pick_col(["Model", "model"])
-        inuse_col = pick_col(["InUseFlag", "inUseFlag", "activeFlag"])
-
-        missing = []
-        if not delivery_col:
-            missing.append("DeliveryDate/date")
-        if not he_col:
-            missing.append("HourEnding/HE")
-        if not region_col:
-            missing.append("Region")
-        if not value_col:
-            missing.append("Value/MW")
-
-        if missing:
-            raise ValueError(
-                f"NP4-443 columns not detected. Missing: {missing}. "
-                f"Actual columns returned: {original_cols}"
-            )
-
-        if inuse_col:
-            active = df[df[inuse_col].astype(str).str.upper() == "Y"].copy()
-            if not active.empty:
-                df = active
-
-        df[delivery_col] = pd.to_datetime(df[delivery_col], errors="coerce")
-        df[he_col] = pd.to_numeric(df[he_col], errors="coerce")
-        df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
-
-        df = df.dropna(subset=[delivery_col, he_col, region_col, value_col]).copy()
-
-        df["target_ts"] = df[delivery_col] + pd.to_timedelta(df[he_col], unit="h")
-        df["series"] = df[region_col].map(normalize_region_name)
-        df = df.dropna(subset=["series"]).copy()
-
-        if model_col:
-            df["model"] = df[model_col].astype(str)
-        else:
-            df["model"] = "NP4-443"
-
-        out = df.rename(columns={value_col: "mw"})
-        out["source"] = "Hourly NP4-443"
-
-        return out[["target_ts", "series", "mw", "model", "source"]].copy()
-
-    def build_intrahour_lead_curve(forecast_long: pd.DataFrame, target_lead_minutes: int, series_order):
-        df = forecast_long.copy()
-        df["lead_minutes"] = (df["target_ts"] - df["posted_ts"]).dt.total_seconds() / 60.0
-        df = df[df["lead_minutes"] >= 0].copy()
-        df = df[df["lead_minutes"] <= 180].copy()
-
-        if df.empty:
-            return pd.DataFrame()
-
-        df["score"] = (df["lead_minutes"] - target_lead_minutes).abs()
-
-        df = df.sort_values(
-            by=["series", "target_ts", "score", "posted_ts"],
-            ascending=[True, True, True, False]
-        )
-
-        picked = df.groupby(["series", "target_ts"], as_index=False).first()
-
-        wide = (
-            picked.pivot_table(
-                index="target_ts",
-                columns="series",
-                values="mw",
-                aggfunc="mean"
-            )
-            .sort_index()
-            .resample("5min")
-            .mean()
-        )
-
-        regional_components = [
-            c for c in ["Center West", "North West", "Far West", "Far East", "South East", "Center East"]
-            if c in wide.columns
-        ]
-
-        if "ERCOT Total" not in wide.columns and regional_components:
-            wide["ERCOT Total"] = wide[regional_components].sum(axis=1, min_count=1)
-
-        ordered = [s for s in series_order if s in wide.columns]
-        return wide[ordered] if ordered else wide
-
-    def build_np4443_curve(hourly_long: pd.DataFrame, model_name: str, series_order):
-        df = hourly_long.copy()
-        if model_name != "All In-Use Models":
-            df = df[df["model"] == model_name].copy()
-
-        if df.empty:
-            return pd.DataFrame()
-
-        wide = (
-            df.pivot_table(
-                index="target_ts",
-                columns="series",
-                values="mw",
-                aggfunc="mean"
-            )
-            .sort_index()
-        )
-
-        regional_components = [
-            c for c in ["Center West", "North West", "Far West", "Far East", "South East", "Center East"]
-            if c in wide.columns
-        ]
-
-        if "ERCOT Total" not in wide.columns and regional_components:
-            wide["ERCOT Total"] = wide[regional_components].sum(axis=1, min_count=1)
-
-        ordered = [s for s in series_order if s in wide.columns]
-        return wide[ordered] if ordered else wide
 
     def align_index(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp):
         if df.empty:
             return df
         return df[(df.index >= start_ts) & (df.index <= end_ts)].copy()
 
-    def make_error_frame(actual_df: pd.DataFrame, forecast_df: pd.DataFrame, series_name: str):
+    def build_base_figure(height=500, yaxis_title="MW"):
+        fig = go.Figure()
+        fig.update_layout(
+            height=height,
+            hovermode="x unified",
+            yaxis_title=yaxis_title,
+            xaxis_title="Time",
+            legend_title_text="Series",
+            margin=dict(l=20, r=20, t=20, b=20),
+        )
+        return fig
+
+    def make_error_frame(actual_series: pd.Series, forecast_series: pd.Series):
         combined = pd.concat(
             [
-                actual_df[[series_name]].rename(columns={series_name: "actual"}),
-                forecast_df[[series_name]].rename(columns={series_name: "forecast"}),
+                actual_series.rename("actual"),
+                forecast_series.rename("forecast"),
             ],
             axis=1
         ).dropna()
@@ -1844,190 +2093,41 @@ elif page == "Solar Trader View":
             "MAPE %": float(error_df["ape"].mean()) if error_df["ape"].notna().any() else np.nan,
         }
 
-    def get_active_np4443_model_info(df: pd.DataFrame):
-            if df.empty:
-                return None
+    # =====================================================
+    # WINDOW HELPER
+    # =====================================================
+    def parse_local_window(label, now):
+        if label == "Last 24 / Next 2":
+            return now - pd.Timedelta(hours=24), now + pd.Timedelta(hours=2)
+        if label == "Last 12 / Next 2":
+            return now - pd.Timedelta(hours=12), now + pd.Timedelta(hours=2)
+        if label == "Last 24 / Next 6":
+            return now - pd.Timedelta(hours=24), now + pd.Timedelta(hours=6)
+        if label == "Last 24 / Next 24":
+            return now - pd.Timedelta(hours=24), now + pd.Timedelta(hours=24)
+        if label == "Last 24":
+            return now - pd.Timedelta(hours=24), now
+        if label == "Last 48":
+            return now - pd.Timedelta(hours=48), now
+        if label == "Last 72":
+            return now - pd.Timedelta(hours=72), now
+        if label == "Last 168":
+            return now - pd.Timedelta(hours=168), now
+        if label == "Next 24":
+            return now, now + pd.Timedelta(hours=24)
+        if label == "Next 48":
+            return now, now + pd.Timedelta(hours=48)
+        if label == "Next 72":
+            return now, now + pd.Timedelta(hours=72)
+        if label == "Next 168":
+            return now, now + pd.Timedelta(hours=168)
+        return now - pd.Timedelta(hours=24), now + pd.Timedelta(hours=2)
 
-            work = df.copy()
-            lower_map = {c.lower().replace("_", "").replace(" ", ""): c for c in work.columns}
-
-            model_col = None
-            inuse_col = None
-            delivery_col = None
-            he_col = None
-
-            for key, col in lower_map.items():
-                if key == "model":
-                    model_col = col
-                elif key == "inuseflag":
-                    inuse_col = col
-                elif key == "deliverydate":
-                    delivery_col = col
-                elif key == "hourending":
-                    he_col = col
-
-            if not model_col:
-                return {
-                    "status": "no_model_column",
-                    "message": "NP4-443 did not include a detectable Model column."
-         }
-
-            # Build target timestamp when possible
-            if delivery_col and he_col:
-                work[delivery_col] = pd.to_datetime(work[delivery_col], errors="coerce")
-                work[he_col] = pd.to_numeric(work[he_col], errors="coerce")
-                work = work.dropna(subset=[delivery_col, he_col]).copy()
-                if not work.empty:
-                    work["target_ts"] = work[delivery_col] + pd.to_timedelta(work[he_col], unit="h")
-
-            # Preferred path: explicit active flag
-            if inuse_col:
-                work["_inuse_norm"] = work[inuse_col].astype(str).str.strip().str.upper()
-
-                active = work[work["_inuse_norm"].isin(["Y", "YES", "TRUE", "1"])].copy()
-                if not active.empty:
-                    model_name = active[model_col].astype(str).mode().iloc[0]
-                    next_target = active["target_ts"].min() if "target_ts" in active.columns else None
-                    return {
-                        "status": "active_flag_found",
-                        "model": model_name,
-                        "next_target_ts": next_target,
-                        "row_count": len(active),
-                        "flag_values": sorted(work["_inuse_norm"].dropna().unique().tolist()),
-                    }
-
-            # Fallback: most recent target/model available
-            if "target_ts" in work.columns and not work.empty:
-                latest_target = work["target_ts"].max()
-                latest_rows = work[work["target_ts"] == latest_target].copy()
-                models = sorted(latest_rows[model_col].astype(str).dropna().unique().tolist())
-
-                return {
-                    "status": "fallback_latest_target",
-                    "models": models,
-                    "latest_target_ts": latest_target,
-                    "row_count": len(latest_rows),
-                    "flag_values": (
-                        sorted(work[inuse_col].astype(str).dropna().unique().tolist())
-                        if inuse_col and inuse_col in work.columns else []
-                    ),
-                }
-
-            # Last fallback: just list available models
-            models = sorted(work[model_col].astype(str).dropna().unique().tolist())
-            return {
-                "status": "fallback_models_only",
-                "models": models,
-                "row_count": len(work),
-                "flag_values": (
-                    sorted(work[inuse_col].astype(str).dropna().unique().tolist())
-                    if inuse_col and inuse_col in work.columns else []
-                ),
-            }
-
-            return None
-
-    def get_intrahour_status(forecast_long: pd.DataFrame, selected_leads, lead_options, now_ts):
-        if forecast_long.empty:
-            return None
-
-        out = []
-
-        for lead_label in selected_leads:
-            target_lead_minutes = lead_options[lead_label]
-            df = forecast_long.copy()
-            df["lead_minutes"] = (df["target_ts"] - df["posted_ts"]).dt.total_seconds() / 60.0
-            df = df[df["lead_minutes"] >= 0].copy()
-            df["score"] = (df["lead_minutes"] - target_lead_minutes).abs()
-
-            future_df = df[df["target_ts"] >= now_ts].copy()
-            if future_df.empty:
-                continue
-
-            future_df = future_df.sort_values(["target_ts", "score", "posted_ts"], ascending=[True, True, False])
-            first_target = future_df["target_ts"].min()
-            picked = future_df[future_df["target_ts"] == first_target].sort_values(
-                ["score", "posted_ts"], ascending=[True, False]
-            )
-
-            if picked.empty:
-                continue
-
-            best = picked.iloc[0]
-            out.append({
-                "lead_label": lead_label,
-                "target_ts": best["target_ts"],
-                "posted_ts": best["posted_ts"],
-                "lead_minutes": best["lead_minutes"],
-            })
-
-        return out
-
-    # ---------------------------------------------------
-    # CONTROLS
-    # ---------------------------------------------------
-    try:
-        st.subheader("Display Controls")
-
-        view_mode = st.selectbox(
-            "Mode",
-            options=[
-                "Actual vs Forecast",
-                "Forecast Error",
-                "Forecast Revisions",
-                "Error Summary",
-                "Table View",
-            ],
-            index=0,
-            key="solar_view_mode_v2"
-        )
-
-        uses_error_display = view_mode == "Forecast Error"
-        uses_revisions = view_mode == "Forecast Revisions"
-        uses_table_toggles = view_mode == "Table View"
-        uses_np4443_controls = view_mode in [
-            "Actual vs Forecast",
-            "Forecast Error",
-            "Error Summary",
-            "Table View",
-        ]
-        uses_intrahour_lines = view_mode in [
-            "Actual vs Forecast",
-            "Forecast Error",
-            "Forecast Revisions",
-            "Error Summary",
-            "Table View",
-        ]
-
-        period = st.selectbox(
-            "Selectable period",
-            options=[
-                "Last 6 hours",
-                "Last 12 hours",
-                "Last 24 hours",
-                "Last 48 hours",
-                "Last 72 hours",
-                "Last 168 hours",
-            ],
-            index=2,
-            key="solar_period_v2"
-        )
-
-        hours_back_map = {
-            "Last 6 hours": 6,
-            "Last 12 hours": 12,
-            "Last 24 hours": 24,
-            "Last 48 hours": 48,
-            "Last 72 hours": 72,
-            "Last 168 hours": 168,
-        }
-
-        now = pd.Timestamp.now(tz="America/Chicago").tz_localize(None).floor("5min")
-        hours_back = hours_back_map[period]
-        start_ts = now - pd.Timedelta(hours=hours_back)
-        end_ts = now
-
-        available_series = [
+    # =====================================================
+    # SOLAR REGION HELPERS
+    # =====================================================
+    def solar_region_order():
+        return [
             "ERCOT Total",
             "Center West",
             "North West",
@@ -2037,578 +2137,797 @@ elif page == "Solar Trader View":
             "Center East",
         ]
 
-        selected_series = st.multiselect(
-            "Regions to graph",
-            options=available_series,
-            default=["ERCOT Total"],
-            key="solar_selected_series_v2"
-        )
+    def add_solar_total_if_missing(df: pd.DataFrame):
+        parts = [c for c in ["Center West", "North West", "Far West", "Far East", "South East", "Center East"] if c in df.columns]
+        if "ERCOT Total" not in df.columns and parts:
+            df["ERCOT Total"] = df[parts].sum(axis=1, min_count=1)
+        ordered = [c for c in solar_region_order() if c in df.columns]
+        return df[ordered] if ordered else df
 
-        if not selected_series:
-            st.warning("Select at least one region or total.")
-            st.stop()
+    # =====================================================
+    # NP4-746 - 5 MIN ACTUALS
+    # =====================================================
+    def normalize_np4746_actual(df: pd.DataFrame):
+        df = df.copy()
 
-        intrahour_lead_options = {
-            "Latest": 0,
-            "1 hour ago": 60,
-            "2 hours ago": 120,
+        time_col = pick_col(df, ["INTERVAL_ENDING", "IntervalEnding", "intervalEnding"])
+        if not time_col:
+            raise ValueError(f"NP4-746: could not detect interval ending column. Columns: {list(df.columns)}")
+
+        df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
+        df = df.dropna(subset=[time_col]).copy()
+
+        region_map = {
+            "SYSTEM_WIDE_GEN": "ERCOT Total",
+            "systemWideGen": "ERCOT Total",
+            "CenterWest_GEN": "Center West",
+            "centerWestGen": "Center West",
+            "NorthWest_GEN": "North West",
+            "northWestGen": "North West",
+            "FarWest_GEN": "Far West",
+            "farWestGen": "Far West",
+            "FarEast_GEN": "Far East",
+            "farEastGen": "Far East",
+            "SouthEast_GEN": "South East",
+            "southEastGen": "South East",
+            "CenterEast_GEN": "Center East",
+            "centerEastGen": "Center East",
+            "SYSTEM_WIDE_HSL": "ERCOT Total HSL",
+            "systemWideHSL": "ERCOT Total HSL",
         }
 
-        default_intrahour_leads = ["Latest", "1 hour ago"]
-        selected_intrahour_leads = st.multiselect(
-            "Intra-hour forecast lines",
-            options=list(intrahour_lead_options.keys()),
-            default=default_intrahour_leads,
-            key="solar_selected_intrahour_leads_v2",
-            disabled=not uses_intrahour_lines,
-            help=None if uses_intrahour_lines else "This setting does not affect the current mode."
+        keep = [time_col]
+        rename_map = {}
+        for raw_col, display in region_map.items():
+            if raw_col in df.columns:
+                keep.append(raw_col)
+                rename_map[raw_col] = display
+
+        out = df[keep].copy().rename(columns=rename_map)
+        for c in out.columns:
+            if c != time_col:
+                out[c] = pd.to_numeric(out[c], errors="coerce")
+
+        out = (
+            out.sort_values(time_col)
+            .drop_duplicates(subset=[time_col], keep="last")
+            .set_index(time_col)
+            .resample("5min")
+            .mean()
         )
 
-        if uses_intrahour_lines and not selected_intrahour_leads:
-            st.warning("Select at least one intra-hour forecast line.")
-            st.stop()
+        out = add_solar_total_if_missing(out)
+        return out, time_col
 
-        if uses_revisions and "Latest" not in selected_intrahour_leads:
-            selected_intrahour_leads = ["Latest"] + selected_intrahour_leads
-            selected_intrahour_leads = list(dict.fromkeys(selected_intrahour_leads))
-            st.info("Forecast Revisions mode requires 'Latest', so it was added automatically.")
+    # =====================================================
+    # NP4-745 - HOURLY ACTUAL / STPPF / PVGRPP / HSL
+    # =====================================================
+    def normalize_np4745_hourly(df: pd.DataFrame):
+        df = df.copy()
 
-        show_np4443 = st.checkbox(
-            "Include NP4-443 hourly forecast",
-            value=True,
-            key="solar_show_np4443_v2",
-            disabled=not uses_np4443_controls,
-            help=None if uses_np4443_controls else "This setting does not affect the current mode."
+        def norm(s):
+            return str(s).strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+
+        col_map = {norm(c): c for c in df.columns}
+
+        def pick(*candidates):
+            for cand in candidates:
+                key = norm(cand)
+                if key in col_map:
+                    return col_map[key]
+            return None
+
+        delivery_col = pick("DELIVERY_DATE", "deliveryDate")
+        he_col = pick("HOUR_ENDING", "hourEnding")
+        posted_col = pick("postedDatetime")
+
+        missing = []
+        if not delivery_col:
+            missing.append("DELIVERY_DATE/deliveryDate")
+        if not he_col:
+            missing.append("HOUR_ENDING/hourEnding")
+        if missing:
+            raise ValueError(f"NP4-745 missing required columns: {missing}. Columns: {list(df.columns)}")
+
+        df[delivery_col] = pd.to_datetime(df[delivery_col], errors="coerce")
+        df[he_col] = pd.to_numeric(df[he_col], errors="coerce")
+        if posted_col:
+            df[posted_col] = pd.to_datetime(df[posted_col], errors="coerce")
+
+        df = df.dropna(subset=[delivery_col, he_col]).copy()
+        df["target_ts"] = df[delivery_col] + pd.to_timedelta(df[he_col], unit="h")
+
+        metric_region_map = {
+            "SYSTEM_WIDE_GEN": ("Actual Gen", "ERCOT Total"),
+            "genSystemWide": ("Actual Gen", "ERCOT Total"),
+            "COP_HSL_SYSTEM_WIDE": ("COP HSL", "ERCOT Total"),
+            "COPHSLSystemWide": ("COP HSL", "ERCOT Total"),
+            "STPPF_SYSTEM_WIDE": ("STPPF", "ERCOT Total"),
+            "STPPFSystemWide": ("STPPF", "ERCOT Total"),
+            "PVGRPP_SYSTEM_WIDE": ("PVGRPP", "ERCOT Total"),
+            "PVGRPPSystemWide": ("PVGRPP", "ERCOT Total"),
+            "SYSTEM_WIDE_HSL": ("System HSL", "ERCOT Total"),
+            "HSLSystemWide": ("System HSL", "ERCOT Total"),
+
+            "GEN_CenterWest": ("Actual Gen", "Center West"),
+            "genCenterWest": ("Actual Gen", "Center West"),
+            "COP_HSL_CenterWest": ("COP HSL", "Center West"),
+            "COPHSLCenterWest": ("COP HSL", "Center West"),
+            "STPPF_CenterWest": ("STPPF", "Center West"),
+            "STPPFCenterWest": ("STPPF", "Center West"),
+            "PVGRPP_CenterWest": ("PVGRPP", "Center West"),
+            "PVGRPPCenterWest": ("PVGRPP", "Center West"),
+
+            "GEN_NorthWest": ("Actual Gen", "North West"),
+            "genNorthWest": ("Actual Gen", "North West"),
+            "COP_HSL_NorthWest": ("COP HSL", "North West"),
+            "COPHSLNorthWest": ("COP HSL", "North West"),
+            "STPPF_NorthWest": ("STPPF", "North West"),
+            "STPPFNorthWest": ("STPPF", "North West"),
+            "PVGRPP_NorthWest": ("PVGRPP", "North West"),
+            "PVGRPPNorthWest": ("PVGRPP", "North West"),
+
+            "GEN_FarWest": ("Actual Gen", "Far West"),
+            "genFarWest": ("Actual Gen", "Far West"),
+            "COP_HSL_FarWest": ("COP HSL", "Far West"),
+            "COPHSLFarWest": ("COP HSL", "Far West"),
+            "STPPF_FarWest": ("STPPF", "Far West"),
+            "STPPFFarWest": ("STPPF", "Far West"),
+            "PVGRPP_FarWest": ("PVGRPP", "Far West"),
+            "PVGRPPFarWest": ("PVGRPP", "Far West"),
+
+            "GEN_FarEast": ("Actual Gen", "Far East"),
+            "genFarEast": ("Actual Gen", "Far East"),
+            "COP_HSL_FarEast": ("COP HSL", "Far East"),
+            "COPHSLFarEast": ("COP HSL", "Far East"),
+            "STPPF_FarEast": ("STPPF", "Far East"),
+            "STPPFFarEast": ("STPPF", "Far East"),
+            "PVGRPP_FarEast": ("PVGRPP", "Far East"),
+            "PVGRPPFarEast": ("PVGRPP", "Far East"),
+
+            "GEN_SouthEast": ("Actual Gen", "South East"),
+            "genSouthEast": ("Actual Gen", "South East"),
+            "COP_HSL_SouthEast": ("COP HSL", "South East"),
+            "COPHSLSouthEast": ("COP HSL", "South East"),
+            "STPPF_SouthEast": ("STPPF", "South East"),
+            "STPPFSouthEast": ("STPPF", "South East"),
+            "PVGRPP_SouthEast": ("PVGRPP", "South East"),
+            "PVGRPPSouthEast": ("PVGRPP", "South East"),
+
+            "GEN_CenterEast": ("Actual Gen", "Center East"),
+            "genCenterEast": ("Actual Gen", "Center East"),
+            "COP_HSL_CenterEast": ("COP HSL", "Center East"),
+            "COPHSLCenterEast": ("COP HSL", "Center East"),
+            "STPPF_CenterEast": ("STPPF", "Center East"),
+            "STPPFCenterEast": ("STPPF", "Center East"),
+            "PVGRPP_CenterEast": ("PVGRPP", "Center East"),
+            "PVGRPPCenterEast": ("PVGRPP", "Center East"),
+        }
+
+        long_frames = []
+
+        for raw_col, (metric_name, region_name) in metric_region_map.items():
+            if raw_col not in df.columns:
+                continue
+
+            temp = df[["target_ts", raw_col]].copy()
+            if posted_col:
+                temp["posted_ts"] = df[posted_col]
+
+            temp["metric"] = metric_name
+            temp["region"] = region_name
+            temp["mw"] = pd.to_numeric(temp[raw_col], errors="coerce")
+            temp = temp.dropna(subset=["mw"]).copy()
+
+            keep_cols = ["target_ts", "region", "metric", "mw"]
+            if posted_col:
+                keep_cols.insert(1, "posted_ts")
+
+            long_frames.append(temp[keep_cols])
+
+        if not long_frames:
+            raise ValueError(f"NP4-745 parser found no usable metric columns. Columns: {list(df.columns)}")
+
+        long_df = pd.concat(long_frames, ignore_index=True)
+
+        if "posted_ts" in long_df.columns:
+            long_df = (
+                long_df.sort_values(["target_ts", "metric", "region", "posted_ts"])
+                .drop_duplicates(subset=["target_ts", "metric", "region"], keep="last")
+                .copy()
+            )
+
+        wide = (
+            long_df.pivot_table(
+                index="target_ts",
+                columns=["metric", "region"],
+                values="mw",
+                aggfunc="mean"
+            )
+            .sort_index()
         )
 
-        error_style = st.selectbox(
-            "Error display",
-            options=["MW Error", "Absolute Error", "Percent Error"],
-            index=0,
-            key="solar_error_style_v2",
-            disabled=not uses_error_display,
-            help=None if uses_error_display else "Only used in Forecast Error mode."
+        return long_df, wide
+
+    # =====================================================
+    # NP4-443 - ACTIVE MODEL STATUS
+    # =====================================================
+    def parse_np4443_active_model_status(df: pd.DataFrame):
+        if df.empty:
+            return pd.DataFrame()
+
+        work = df.copy()
+
+        delivery_col = pick_col(work, ["DeliveryDate", "deliveryDate"])
+        he_col = pick_col(work, ["HourEnding", "hourEnding"])
+        region_col = pick_col(work, ["Region", "region"])
+        model_col = pick_col(work, ["Model", "model"])
+        inuse_col = pick_col(work, ["InUseFlag", "inUseFlag"])
+
+        missing = []
+        for col_name, actual_col in {
+            "DeliveryDate": delivery_col,
+            "HourEnding": he_col,
+            "Region": region_col,
+            "Model": model_col,
+            "InUseFlag": inuse_col,
+        }.items():
+            if actual_col is None:
+                missing.append(col_name)
+
+        if missing:
+            return pd.DataFrame()
+
+        work[delivery_col] = pd.to_datetime(work[delivery_col], errors="coerce")
+        work[he_col] = pd.to_numeric(work[he_col], errors="coerce")
+        work = work.dropna(subset=[delivery_col, he_col]).copy()
+        work["target_ts"] = work[delivery_col] + pd.to_timedelta(work[he_col], unit="h")
+
+        active = work[work[inuse_col].astype(str).str.upper() == "Y"].copy()
+        if active.empty:
+            return pd.DataFrame()
+
+        def normalize_region(x):
+            s = normalize_key(x)
+            if s == "systemtotal":
+                return "ERCOT Total"
+            mapping = {
+                "centereast": "Center East",
+                "centerwest": "Center West",
+                "northwest": "North West",
+                "farwest": "Far West",
+                "fareast": "Far East",
+                "southeast": "South East",
+            }
+            return mapping.get(s)
+
+        active["RegionStd"] = active[region_col].map(normalize_region)
+        active = active.dropna(subset=["RegionStd"]).copy()
+
+        latest_target = active["target_ts"].max()
+        latest = active[active["target_ts"] == latest_target].copy()
+
+        status = (
+            latest[["RegionStd", model_col, "target_ts"]]
+            .rename(columns={"RegionStd": "Region", model_col: "Active Model", "target_ts": "Target Time"})
+            .sort_values("Region")
         )
 
-        st.markdown("**Table View Toggles**")
-        table_col1, table_col2, table_col3, table_col4 = st.columns(4)
+        return status
 
-        with table_col1:
-            show_actual_cols = st.checkbox(
-                "Table: Actual",
-                value=True,
-                key="solar_table_actual_v2",
-                disabled=not uses_table_toggles
+    # =====================================================
+    # PAGE
+    # =====================================================
+    try:
+        now = pd.Timestamp.now(tz="America/Chicago").tz_localize(None).floor("5min")
+
+        st.subheader("Page Options")
+        page_opt1, page_opt2 = st.columns(2)
+        with page_opt1:
+            load_np4443 = st.checkbox(
+                "Load NP4-443 active model status",
+                value=False,
+                key="solar_load_np4443_v3"
+            )
+        with page_opt2:
+            show_tables = st.checkbox(
+                "Show data tables",
+                value=False,
+                key="solar_show_tables_v3"
             )
 
-        with table_col2:
-            show_intrahour_cols = st.checkbox(
-                "Table: Intra-hour forecast",
-                value=True,
-                key="solar_table_intrahour_v2",
-                disabled=not uses_table_toggles
+        actual_from = (now - pd.Timedelta(days=7)).strftime("%Y-%m-%dT%H:%M")
+        actual_to = now.strftime("%Y-%m-%dT%H:%M")
+
+        actual_res = safe_load_product(
+            ACTUAL_5MIN_PRODUCT_URL,
+            posted_from=actual_from,
+            posted_to=actual_to,
+            size=40000,
+            timeout=60,
+        )
+
+        hourly_res = safe_load_product(
+            HOURLY_PRODUCT_URL,
+            posted_from=None,
+            posted_to=None,
+            size=1000,
+            timeout=45,
+        )
+
+        if load_np4443:
+            model_status_res = safe_load_product(
+                MODEL_STATUS_PRODUCT_URL,
+                posted_from=None,
+                posted_to=None,
+                size=20000,
+                timeout=45,
             )
-
-        with table_col3:
-            show_np4443_cols = st.checkbox(
-                "Table: NP4-443 forecast",
-                value=True,
-                key="solar_table_np4443_v2",
-                disabled=not uses_table_toggles
-            )
-
-        with table_col4:
-            show_error_cols = st.checkbox(
-                "Table: Error columns",
-                value=True,
-                key="solar_table_error_v2",
-                disabled=not uses_table_toggles
-            )
-
-        if not uses_table_toggles:
-            show_actual_cols = True
-            show_intrahour_cols = True
-            show_np4443_cols = True
-            show_error_cols = False
-
-        if hours_back <= 24:
-            actual_size = 18000
-            intrahour_size = 70000
-        elif hours_back <= 72:
-            actual_size = 40000
-            intrahour_size = 120000
         else:
-            actual_size = 80000
-            intrahour_size = 250000
+            model_status_res = {
+                "ok": False,
+                "endpoint": None,
+                "df": pd.DataFrame(),
+                "error": None,
+            }
 
-        np4443_size = 250000
+        actual_df = pd.DataFrame()
+        actual_error = None
+        actual_time_col = None
+        if actual_res["ok"]:
+            try:
+                actual_df, actual_time_col = normalize_np4746_actual(actual_res["df"])
+            except Exception as e:
+                actual_error = str(e)
+        else:
+            actual_error = actual_res["error"]
 
-        intrahour_posted_start = start_ts - pd.Timedelta(hours=3)
+        hourly_long = pd.DataFrame()
+        hourly_wide = pd.DataFrame()
+        hourly_error = None
+        if hourly_res["ok"]:
+            try:
+                hourly_long, hourly_wide = normalize_np4745_hourly(hourly_res["df"])
+            except Exception as e:
+                hourly_error = str(e)
+        else:
+            hourly_error = hourly_res["error"]
 
-        actual_posted_from = start_ts.strftime("%Y-%m-%dT%H:%M")
-        actual_posted_to = end_ts.strftime("%Y-%m-%dT%H:%M")
-
-        intrahour_posted_from = intrahour_posted_start.strftime("%Y-%m-%dT%H:%M")
-        intrahour_posted_to = end_ts.strftime("%Y-%m-%dT%H:%M")
-
-        # ---------------------------------------------------
-        # LOAD DATA
-        # ---------------------------------------------------
-        actual_endpoint, _ = get_artifact_endpoint(ACTUAL_PRODUCT_URL)
-        intrahour_endpoint, _ = get_artifact_endpoint(INTRAHOUR_FORECAST_PRODUCT_URL)
-        np4443_endpoint, _ = get_artifact_endpoint(HOURLY_FORECAST_PRODUCT_URL)
-
-        actual_raw = load_report(actual_endpoint, actual_posted_from, actual_posted_to, actual_size)
-        intrahour_raw = load_report(intrahour_endpoint, intrahour_posted_from, intrahour_posted_to, intrahour_size)
-        np4443_raw = load_report(np4443_endpoint, None, None, np4443_size)
-
-        actual_regional_df, actual_time_col = normalize_actual_regional_df(actual_raw)
-        intrahour_long, intrahour_posted_col, intrahour_target_col = normalize_intrahour_forecast_long(intrahour_raw)
-        np4443_long = normalize_np4443_hourly(np4443_raw)
-
-        actual_regional_df = align_index(actual_regional_df, start_ts, end_ts)
-
-        intrahour_long = intrahour_long[
-            (intrahour_long["target_ts"] >= start_ts) &
-            (intrahour_long["target_ts"] <= end_ts)
-        ].copy()
-
-        np4443_long = np4443_long[
-            (np4443_long["target_ts"] >= start_ts) &
-            (np4443_long["target_ts"] <= end_ts)
-        ].copy()
-
-        if actual_regional_df.empty:
-            st.warning("No actual solar data returned for that period.")
-            st.stop()
-
-        if intrahour_long.empty and np4443_long.empty:
-            st.warning("No forecast solar data returned for that period.")
-            st.stop()
-
-        selected_available_series = [
-            s for s in selected_series
-            if s in actual_regional_df.columns
-            or (not intrahour_long.empty and s in intrahour_long["series"].unique().tolist())
-            or (not np4443_long.empty and s in np4443_long["series"].unique().tolist())
-            or s == "ERCOT Total"
-        ]
-
-        if not selected_available_series:
-            st.warning("Selected series were not found in the returned data.")
-            st.stop()
-
-        intrahour_curves = {}
-        for lead_label in selected_intrahour_leads:
-            lead_minutes = intrahour_lead_options[lead_label]
-            curve = build_intrahour_lead_curve(intrahour_long, lead_minutes, available_series)
-            curve = align_index(curve, start_ts, end_ts)
-            intrahour_curves[lead_label] = curve
-
-        np4443_models = []
-        np4443_curve = pd.DataFrame()
-        np4443_model_selected = "All In-Use Models"
-
-        if show_np4443 and not np4443_long.empty:
-            model_values = sorted(np4443_long["model"].dropna().astype(str).unique().tolist())
-            np4443_models = ["All In-Use Models"] + model_values
-
-            np4443_model_selected = st.selectbox(
-                "NP4-443 model",
-                options=np4443_models,
-                index=0,
-                key="solar_np4443_model_v2",
-                disabled=not uses_np4443_controls
-            )
-
-            np4443_curve = build_np4443_curve(np4443_long, np4443_model_selected, available_series)
-            np4443_curve = align_index(np4443_curve, start_ts, end_ts)
-
-        # ---------------------------------------------------
-        # STATUS PANEL
-        # ---------------------------------------------------
-        st.subheader("Current Forecast Status")
-
-        status_col1, status_col2 = st.columns(2)
-
-        with status_col1:
-            active_np4443 = get_active_np4443_model_info(np4443_raw)
-
-            if not active_np4443:
-                st.warning("Could not determine NP4-443 model status.")
-            elif active_np4443["status"] == "active_flag_found":
-                st.info(
-                    f"Hourly active model: {active_np4443['model']}"
-                    + (
-                        f" | Next target: {active_np4443['next_target_ts']:%Y-%m-%d %H:%M}"
-                        if active_np4443.get("next_target_ts") is not None else ""
-                    )
-                )
-            elif active_np4443["status"] == "fallback_latest_target":
-                st.warning(
-                    "No explicit active InUseFlag row detected. "
-                    f"Most recent target has model(s): {', '.join(active_np4443['models'])}"
-                    + (
-                        f" | Latest target: {active_np4443['latest_target_ts']:%Y-%m-%d %H:%M}"
-                        if active_np4443.get("latest_target_ts") is not None else ""
-                    )
-                )
-            elif active_np4443["status"] == "fallback_models_only":
-                st.warning(
-                    "No explicit active InUseFlag row detected. "
-                    f"Available NP4-443 model(s): {', '.join(active_np4443['models'][:10])}"
-                )
-            else:
-                st.warning(active_np4443.get("message", "Could not determine NP4-443 model status."))
-
-        with status_col2:
-            intrahour_status = get_intrahour_status(
-                intrahour_long,
-                selected_intrahour_leads,
-                intrahour_lead_options,
-                now
-            )
-
-            if intrahour_status:
-                lines = []
-                for item in intrahour_status:
-                    lines.append(
-                        f"{item['lead_label']}: posted {item['posted_ts']:%Y-%m-%d %H:%M}, "
-                        f"target {item['target_ts']:%Y-%m-%d %H:%M}, "
-                        f"lead {item['lead_minutes']:.0f} min"
-                    )
-                st.success("Intra-hour forecast currently being plotted:\n\n" + "\n\n".join(lines))
-            else:
-                st.warning("Could not determine current intra-hour posted forecast status.")
-
-        st.subheader("Solar Trader Graph")
-        st.caption("Long-horizon chart includes hourly NP4-443 and intra-hour forecasts when available.")
+        model_status_df = pd.DataFrame()
+        model_status_error = None
+        if model_status_res["ok"]:
+            try:
+                model_status_df = parse_np4443_active_model_status(model_status_res["df"])
+            except Exception as e:
+                model_status_error = str(e)
+        else:
+            model_status_error = None
 
         palette = px.colors.qualitative.Plotly
-        color_map = {series: palette[i % len(palette)] for i, series in enumerate(available_series)}
+        color_map = {series: palette[i % len(palette)] for i, series in enumerate(solar_region_order())}
 
-        fig = go.Figure()
+        # =====================================================
+        # STATUS STRIP
+        # =====================================================
+        st.subheader("Status")
 
-        if view_mode == "Actual vs Forecast":
-            for series_name in selected_available_series:
-                if series_name in actual_regional_df.columns:
-                    fig.add_trace(
-                        go.Scatter(
-                            x=actual_regional_df.index,
-                            y=actual_regional_df[series_name],
-                            mode="lines",
-                            name=f"{series_name} Actual",
-                            line=dict(color=color_map[series_name], dash="solid"),
-                            hovertemplate=(
-                                f"Series: {series_name} Actual<br>"
-                                "Time: %{x}<br>"
-                                "MW: %{y:,.0f}<extra></extra>"
-                            ),
-                        )
-                    )
+        s1, s2, s3 = st.columns(3)
 
-                for lead_label in selected_intrahour_leads:
-                    curve = intrahour_curves.get(lead_label, pd.DataFrame())
-                    if not curve.empty and series_name in curve.columns:
-                        dash_style = {
-                            "Latest": "dash",
-                            "1 hour ago": "dot",
-                            "2 hours ago": "dashdot",
-                        }.get(lead_label, "dash")
+        with s1:
+            if not actual_df.empty and "ERCOT Total" in actual_df.columns and actual_df["ERCOT Total"].dropna().any():
+                val = actual_df["ERCOT Total"].dropna().iloc[-1]
+                ts = actual_df["ERCOT Total"].dropna().index[-1]
+                st.metric("Latest 5-Min Actual", f"{val:,.0f} MW", help=f"As of {ts:%Y-%m-%d %H:%M}")
+            else:
+                st.metric("Latest 5-Min Actual", "n/a")
 
-                        fig.add_trace(
+        with s2:
+            key = ("STPPF", "ERCOT Total")
+            if not hourly_wide.empty and key in hourly_wide.columns and hourly_wide[key].dropna().any():
+                val = hourly_wide[key].dropna().iloc[0]
+                ts = hourly_wide[key].dropna().index[0]
+                st.metric("Hourly STPPF", f"{val:,.0f} MW", help=f"First target {ts:%Y-%m-%d %H:%M}")
+            else:
+                st.metric("Hourly STPPF", "n/a")
+
+        with s3:
+            key = ("PVGRPP", "ERCOT Total")
+            if not hourly_wide.empty and key in hourly_wide.columns and hourly_wide[key].dropna().any():
+                val = hourly_wide[key].dropna().iloc[0]
+                ts = hourly_wide[key].dropna().index[0]
+                st.metric("Hourly PVGRPP", f"{val:,.0f} MW", help=f"First target {ts:%Y-%m-%d %H:%M}")
+            else:
+                st.metric("Hourly PVGRPP", "n/a")
+
+        if load_np4443:
+            st.subheader("Active Hourly Model Status (NP4-443)")
+            if not model_status_df.empty:
+                st.dataframe(model_status_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("Active hourly model status not available for this load.")
+
+        # =====================================================
+        # CHART 1 - TRADER VIEW
+        # =====================================================
+        st.subheader("Trader View: Recent + Near-Term")
+
+        tv_c1, tv_c2, tv_c3 = st.columns(3)
+        with tv_c1:
+            trader_window = st.selectbox(
+                "Trader window",
+                ["Last 24 / Next 2", "Last 12 / Next 2", "Last 24 / Next 6", "Last 24 / Next 24"],
+                index=0,
+                key="solar_trader_window_v3"
+            )
+        with tv_c2:
+            trader_regions = st.multiselect(
+                "Trader regions",
+                options=solar_region_order(),
+                default=["ERCOT Total"],
+                key="solar_trader_regions_v3"
+            )
+        with tv_c3:
+            trader_show_actual = st.checkbox(
+                "Show 5-minute actuals",
+                value=True,
+                key="solar_trader_show_actual_v3"
+            )
+            trader_show_stppf = st.checkbox(
+                "Show STPPF",
+                value=True,
+                key="solar_trader_show_stppf_v3"
+            )
+
+        trader_start, trader_end = parse_local_window(trader_window, now)
+
+        actual_trader = align_index(actual_df, trader_start, trader_end) if not actual_df.empty else pd.DataFrame()
+        hourly_trader = align_index(hourly_wide, trader_start, trader_end) if not hourly_wide.empty else pd.DataFrame()
+
+        available_trader_series = [
+            s for s in trader_regions
+            if s in actual_df.columns
+            or (not hourly_wide.empty and ("STPPF", s) in hourly_wide.columns)
+        ]
+
+        trader_fig = build_base_figure(height=720, yaxis_title="MW")
+        trader_has_data = False
+
+        # STPPF first
+        for r in available_trader_series:
+            if trader_show_stppf and not hourly_trader.empty:
+                stppf_key = ("STPPF", r)
+                if stppf_key in hourly_trader.columns:
+                    x = hourly_trader[stppf_key].dropna()
+                    if not x.empty:
+                        trader_has_data = True
+                        trader_fig.add_trace(
                             go.Scatter(
-                                x=curve.index,
-                                y=curve[series_name],
-                                mode="lines",
-                                name=f"{series_name} Intra-hour {lead_label}",
-                                line=dict(color=color_map[series_name], dash=dash_style),
-                                hovertemplate=(
-                                    f"Series: {series_name} Intra-hour {lead_label}<br>"
-                                    "Time: %{x}<br>"
-                                    "MW: %{y:,.0f}<extra></extra>"
-                                ),
+                                x=x.index,
+                                y=x.values,
+                                name=f"{r} STPPF",
+                                line=dict(color=color_map.get(r, None), dash="dash", width=2),
+                                line_shape="hv",
+                                hovertemplate=f"{r} STPPF<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
                             )
                         )
 
-                if show_np4443 and not np4443_curve.empty and series_name in np4443_curve.columns:
-                    fig.add_trace(
+        # actuals last
+        for r in available_trader_series:
+            if trader_show_actual and not actual_trader.empty and r in actual_trader.columns:
+                x = actual_trader[r].dropna()
+                if not x.empty:
+                    trader_has_data = True
+                    trader_fig.add_trace(
                         go.Scatter(
-                            x=np4443_curve.index,
-                            y=np4443_curve[series_name],
-                            mode="lines",
-                            name=f"{series_name} NP4-443",
-                            line=dict(color=color_map[series_name], dash="longdash"),
-                            hovertemplate=(
-                                f"Series: {series_name} NP4-443"
-                                + (f" ({np4443_model_selected})" if np4443_model_selected else "")
-                                + "<br>Time: %{x}<br>MW: %{y:,.0f}<extra></extra>"
-                            ),
+                            x=x.index,
+                            y=x.values,
+                            name=f"{r} Actual",
+                            line=dict(color=color_map.get(r, None), width=4),
+                            hovertemplate=f"{r} Actual<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
                         )
                     )
 
-            fig.update_layout(
-                xaxis_title="Time",
-                yaxis_title="MW",
-                hovermode="x unified",
-                legend_title_text="Series",
-                height=760,
-                margin=dict(l=20, r=20, t=20, b=20),
+        if trader_has_data:
+            trader_fig.add_vline(
+                x=now,
+                line_width=2,
+                line_dash="dash",
+            )
+            st.plotly_chart(trader_fig, use_container_width=True, key="solar_trader_chart_v3")
+        else:
+            st.info("No trader-view data available for the selected window.")
+
+        # =====================================================
+        # CHART 2 - HOURLY OUTLOOK
+        # =====================================================
+        st.subheader("Hourly Solar Outlook (NP4-745)")
+
+        ho_c1, ho_c2, ho_c3, ho_c4 = st.columns(4)
+        with ho_c1:
+            hourly_window = st.selectbox(
+                "Hourly window",
+                ["Next 24", "Next 48", "Next 72", "Next 168", "Trader Span", "Last 24 / Next 24"],
+                index=2,
+                key="solar_hourly_window_v3"
+            )
+        with ho_c2:
+            hourly_metric = st.selectbox(
+                "Hourly forecast metric",
+                ["STPPF", "PVGRPP", "COP HSL", "System HSL"],
+                index=0,
+                key="solar_hourly_metric_v3"
+            )
+        with ho_c3:
+            hourly_regions = st.multiselect(
+                "Hourly regions",
+                options=solar_region_order(),
+                default=["ERCOT Total", "Far West", "Far East"],
+                key="solar_hourly_regions_v3"
+            )
+        with ho_c4:
+            hourly_show_actual = st.checkbox(
+                "Overlay hourly actuals",
+                value=True,
+                key="solar_hourly_show_actual_v3"
             )
 
-        elif view_mode == "Forecast Error":
-            metric_map = {
-                "MW Error": "error_mw",
-                "Absolute Error": "abs_error_mw",
-                "Percent Error": "pct_error",
-            }
-            y_col = metric_map[error_style]
-            y_title = {
-                "MW Error": "Forecast - Actual (MW)",
-                "Absolute Error": "Absolute Error (MW)",
-                "Percent Error": "Forecast Error (%)",
-            }[error_style]
+        if hourly_window == "Trader Span":
+            hourly_start, hourly_end = trader_start, trader_end
+        elif hourly_window == "Last 24 / Next 24":
+            hourly_start, hourly_end = now - pd.Timedelta(hours=24), now + pd.Timedelta(hours=24)
+        else:
+            hourly_start, hourly_end = parse_local_window(hourly_window, now)
 
-            for series_name in selected_available_series:
-                if series_name not in actual_regional_df.columns:
-                    continue
+        hourly_chart = align_index(hourly_wide, hourly_start, hourly_end) if not hourly_wide.empty else pd.DataFrame()
 
-                for lead_label in selected_intrahour_leads:
-                    curve = intrahour_curves.get(lead_label, pd.DataFrame())
-                    if curve.empty or series_name not in curve.columns:
-                        continue
+        hourly_fig = build_base_figure(height=520, yaxis_title="MW")
+        hourly_has_data = False
 
-                    err = make_error_frame(actual_regional_df, curve, series_name)
-                    if err.empty:
-                        continue
+        if not hourly_chart.empty:
+            for region in hourly_regions:
+                forecast_key = (hourly_metric, region)
+                if forecast_key in hourly_chart.columns:
+                    series = hourly_chart[forecast_key].dropna()
+                    if not series.empty:
+                        hourly_has_data = True
+                        hourly_fig.add_trace(
+                            go.Scatter(
+                                x=series.index,
+                                y=series.values,
+                                name=f"{region} {hourly_metric}",
+                                line=dict(color=color_map.get(region, None), dash="dash", width=2),
+                                line_shape="hv",
+                                hovertemplate=f"{region} {hourly_metric}<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
+                            )
+                        )
 
-                    fig.add_trace(
+            if hourly_show_actual:
+                for region in hourly_regions:
+                    actual_key = ("Actual Gen", region)
+                    if actual_key in hourly_chart.columns:
+                        series = hourly_chart[actual_key].dropna()
+                        if not series.empty:
+                            hourly_has_data = True
+                            hourly_fig.add_trace(
+                                go.Scatter(
+                                    x=series.index,
+                                    y=series.values,
+                                    name=f"{region} Actual Gen",
+                                    line=dict(color=color_map.get(region, None), width=4),
+                                    line_shape="hv",
+                                    hovertemplate=f"{region} Actual Gen<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
+                                )
+                            )
+
+        if hourly_has_data:
+            hourly_fig.add_vline(
+                x=now,
+                line_width=2,
+                line_dash="dash",
+            )
+            st.plotly_chart(hourly_fig, use_container_width=True, key="solar_hourly_chart_v3")
+        else:
+            st.info("No NP4-745 data available for the selected metric / regions / window.")
+
+        # =====================================================
+        # CHART 3 - HISTORICAL ERROR
+        # =====================================================
+        st.subheader("Historical Hourly Forecast Error")
+
+        er_c1, er_c2, er_c3 = st.columns(3)
+        with er_c1:
+            history_window = st.selectbox(
+                "Error history window",
+                ["Last 24", "Last 48", "Last 72", "Last 168"],
+                index=0,
+                key="solar_error_history_window_v3"
+            )
+        with er_c2:
+            error_metric = st.selectbox(
+                "Error metric",
+                ["MW Error", "Absolute Error", "Percent Error"],
+                index=0,
+                key="solar_error_metric_v3"
+            )
+        with er_c3:
+            hourly_error_source = st.selectbox(
+                "Forecast source",
+                ["STPPF", "PVGRPP"],
+                index=0,
+                key="solar_hourly_error_source_v3"
+            )
+
+        error_regions = st.multiselect(
+            "Error regions",
+            options=solar_region_order(),
+            default=["ERCOT Total", "Far West", "Far East"],
+            key="solar_error_regions_v3"
+        )
+
+        history_start, history_end = parse_local_window(history_window, now)
+        hourly_history = align_index(hourly_wide, history_start, history_end) if not hourly_wide.empty else pd.DataFrame()
+
+        metric_map = {
+            "MW Error": "error_mw",
+            "Absolute Error": "abs_error_mw",
+            "Percent Error": "pct_error",
+        }
+        y_col = metric_map.get(error_metric, "error_mw")
+        y_title = {
+            "error_mw": "Forecast - Actual (MW)",
+            "abs_error_mw": "Absolute Error (MW)",
+            "pct_error": "Forecast Error (%)",
+        }[y_col]
+
+        error_fig = build_base_figure(height=420, yaxis_title=y_title)
+        error_has_data = False
+
+        for r in error_regions:
+            actual_key = ("Actual Gen", r)
+            forecast_key = (hourly_error_source, r)
+
+            if not hourly_history.empty and actual_key in hourly_history.columns and forecast_key in hourly_history.columns:
+                err = make_error_frame(hourly_history[actual_key], hourly_history[forecast_key])
+                if not err.empty and y_col in err.columns:
+                    error_has_data = True
+                    error_fig.add_trace(
                         go.Scatter(
                             x=err.index,
                             y=err[y_col],
-                            mode="lines",
-                            name=f"{series_name} Intra-hour {lead_label}",
-                            line=dict(color=color_map[series_name], dash={
-                                "Latest": "dash",
-                                "1 hour ago": "dot",
-                                "2 hours ago": "dashdot",
-                            }.get(lead_label, "dash")),
-                            hovertemplate=(
-                                f"Series: {series_name} Intra-hour {lead_label}<br>"
-                                "Time: %{x}<br>"
-                                f"{y_title}: "
-                                + ("%{y:,.1f}%" if y_col == "pct_error" else "%{y:,.0f}")
-                                + "<extra></extra>"
-                            ),
+                            name=f"{r} {hourly_error_source} Error",
+                            line=dict(color=color_map.get(r, None)),
+                            hovertemplate=f"{r} {hourly_error_source} Error<br>%{{x}}<br>%{{y}}<extra></extra>",
                         )
                     )
 
-                if show_np4443 and not np4443_curve.empty and series_name in np4443_curve.columns:
-                    err = make_error_frame(actual_regional_df, np4443_curve, series_name)
-                    if not err.empty:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=err.index,
-                                y=err[y_col],
-                                mode="lines",
-                                name=f"{series_name} NP4-443",
-                                line=dict(color=color_map[series_name], dash="longdash"),
-                                hovertemplate=(
-                                    f"Series: {series_name} NP4-443<br>"
-                                    "Time: %{x}<br>"
-                                    f"{y_title}: "
-                                    + ("%{y:,.1f}%" if y_col == "pct_error" else "%{y:,.0f}")
-                                    + "<extra></extra>"
-                                ),
-                            )
-                        )
+        if error_has_data:
+            if y_col != "abs_error_mw":
+                error_fig.add_hline(y=0, line_dash="solid", line_width=1)
+            st.plotly_chart(error_fig, use_container_width=True, key="solar_error_chart_v3")
+        else:
+            st.info("No overlapping hourly actual / forecast history exists for the selected error window.")
 
-            fig.update_layout(
-                xaxis_title="Time",
-                yaxis_title=y_title,
-                hovermode="x unified",
-                legend_title_text="Series",
-                height=760,
-                margin=dict(l=20, r=20, t=20, b=20),
-            )
-            if error_style != "Absolute Error":
-                fig.add_hline(y=0, line_dash="solid", line_width=1)
+        # =====================================================
+        # SUMMARY TABLE
+        # =====================================================
+        st.subheader("Hourly Error Summary")
 
-        elif view_mode == "Forecast Revisions":
-            latest_curve = intrahour_curves.get("Latest", pd.DataFrame())
-            older_labels = [x for x in selected_intrahour_leads if x != "Latest"]
+        summary_rows = []
+        for r in error_regions:
+            actual_key = ("Actual Gen", r)
+            for src in ["STPPF", "PVGRPP"]:
+                forecast_key = (src, r)
+                if not hourly_history.empty and actual_key in hourly_history.columns and forecast_key in hourly_history.columns:
+                    err = make_error_frame(hourly_history[actual_key], hourly_history[forecast_key])
+                    row = summarize_error_metrics(err, src, r)
+                    if row:
+                        summary_rows.append(row)
 
-            if latest_curve.empty:
-                st.warning("Forecast Revisions mode needs 'Latest' selected and available.")
-                st.stop()
-            if not older_labels:
-                st.warning("Forecast Revisions mode needs 'Latest' plus at least one older intra-hour line.")
-                st.stop()
+        summary_df = pd.DataFrame(summary_rows)
+        if not summary_df.empty:
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No overlapping hourly history available for summary metrics.")
 
-            for series_name in selected_available_series:
-                if series_name not in latest_curve.columns:
-                    continue
+        # =====================================================
+        # TABLES / EXPORT
+        # =====================================================
+        if show_tables:
+            st.subheader("Data Tables")
 
-                for older_label in older_labels:
-                    older_curve = intrahour_curves.get(older_label, pd.DataFrame())
-                    if older_curve.empty or series_name not in older_curve.columns:
-                        continue
+            trader_table = pd.DataFrame(index=actual_trader.index if not actual_trader.empty else pd.Index([]))
+            for r in available_trader_series:
+                if trader_show_actual and not actual_trader.empty and r in actual_trader.columns:
+                    trader_table[f"{r} Actual"] = actual_trader[r]
+                if trader_show_stppf and not hourly_trader.empty and ("STPPF", r) in hourly_trader.columns:
+                    trader_table[f"{r} STPPF"] = hourly_trader[("STPPF", r)]
 
-                    combined = pd.concat(
-                        [
-                            latest_curve[[series_name]].rename(columns={series_name: "latest"}),
-                            older_curve[[series_name]].rename(columns={series_name: "older"})
-                        ],
-                        axis=1
-                    ).dropna()
+            hourly_table = pd.DataFrame(index=hourly_chart.index if not hourly_chart.empty else pd.Index([]))
+            for region in hourly_regions:
+                forecast_key = (hourly_metric, region)
+                if not hourly_chart.empty and forecast_key in hourly_chart.columns:
+                    hourly_table[f"{region} {hourly_metric}"] = hourly_chart[forecast_key]
+                actual_key = ("Actual Gen", region)
+                if hourly_show_actual and not hourly_chart.empty and actual_key in hourly_chart.columns:
+                    hourly_table[f"{region} Actual Gen"] = hourly_chart[actual_key]
 
-                    if combined.empty:
-                        continue
+            st.markdown("**Main Trader Data**")
+            st.dataframe(trader_table.reset_index(), use_container_width=True, hide_index=True)
 
-                    combined["revision"] = combined["latest"] - combined["older"]
+            st.markdown("**Hourly Outlook Data**")
+            st.dataframe(hourly_table.reset_index(), use_container_width=True, hide_index=True)
 
-                    fig.add_trace(
-                        go.Scatter(
-                            x=combined.index,
-                            y=combined["revision"],
-                            mode="lines",
-                            name=f"{series_name} Revision vs {older_label}",
-                            line=dict(color=color_map[series_name], dash={
-                                "1 hour ago": "dot",
-                                "2 hours ago": "dashdot",
-                            }.get(older_label, "dot")),
-                            hovertemplate=(
-                                f"Series: {series_name} Revision vs {older_label}<br>"
-                                "Time: %{x}<br>"
-                                "Latest - Older: %{y:,.0f} MW<extra></extra>"
-                            ),
-                        )
-                    )
+            trader_csv = trader_table.reset_index().to_csv(index=False).encode("utf-8")
+            hourly_csv = hourly_table.reset_index().to_csv(index=False).encode("utf-8")
 
-            fig.update_layout(
-                xaxis_title="Time",
-                yaxis_title="Latest Forecast - Older Forecast (MW)",
-                hovermode="x unified",
-                legend_title_text="Series",
-                height=760,
-                margin=dict(l=20, r=20, t=20, b=20),
-            )
-            fig.add_hline(y=0, line_dash="solid", line_width=1)
+            d1, d2 = st.columns(2)
+            with d1:
+                st.download_button(
+                    "Download trader data CSV",
+                    data=trader_csv,
+                    file_name="ercot_solar_trader_main.csv",
+                    mime="text/csv",
+                    key="solar_trader_main_download_v3"
+                )
+            with d2:
+                st.download_button(
+                    "Download hourly data CSV",
+                    data=hourly_csv,
+                    file_name="ercot_solar_hourly_np4745.csv",
+                    mime="text/csv",
+                    key="solar_hourly_download_v3"
+                )
 
-        elif view_mode == "Error Summary":
-            summary_rows = []
-
-            for series_name in selected_available_series:
-                if series_name in actual_regional_df.columns:
-                    for lead_label in selected_intrahour_leads:
-                        curve = intrahour_curves.get(lead_label, pd.DataFrame())
-                        if curve.empty or series_name not in curve.columns:
-                            continue
-                        err = make_error_frame(actual_regional_df, curve, series_name)
-                        row = summarize_error_metrics(err, f"Intra-hour {lead_label}", series_name)
-                        if row:
-                            summary_rows.append(row)
-
-                    if show_np4443 and not np4443_curve.empty and series_name in np4443_curve.columns:
-                        err = make_error_frame(actual_regional_df, np4443_curve, series_name)
-                        row = summarize_error_metrics(err, "NP4-443", series_name)
-                        if row:
-                            summary_rows.append(row)
-
-            summary_df = pd.DataFrame(summary_rows)
-            if summary_df.empty:
-                st.warning("No overlapping forecast vs actual data available for summary metrics.")
-            else:
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
-
-        if view_mode in ["Actual vs Forecast", "Forecast Error", "Forecast Revisions"]:
-            st.plotly_chart(fig, use_container_width=True, key="solar_trader_chart_v2")
-
-        # ---------------------------------------------------
-        # TABLE VIEW / EXPORT
-        # ---------------------------------------------------
-        table_df = pd.DataFrame(index=actual_regional_df.index)
-
-        if show_actual_cols:
-            for series_name in selected_available_series:
-                if series_name in actual_regional_df.columns:
-                    table_df[f"{series_name} Actual"] = actual_regional_df[series_name]
-
-        if show_intrahour_cols:
-            for series_name in selected_available_series:
-                for lead_label in selected_intrahour_leads:
-                    curve = intrahour_curves.get(lead_label, pd.DataFrame())
-                    if not curve.empty and series_name in curve.columns:
-                        table_df[f"{series_name} Intra-hour {lead_label}"] = curve[series_name]
-
-        if show_np4443_cols and show_np4443 and not np4443_curve.empty:
-            for series_name in selected_available_series:
-                if series_name in np4443_curve.columns:
-                    table_df[f"{series_name} NP4-443"] = np4443_curve[series_name]
-
-        if show_error_cols:
-            for series_name in selected_available_series:
-                if series_name in actual_regional_df.columns:
-                    latest_curve = intrahour_curves.get("Latest", pd.DataFrame())
-                    if not latest_curve.empty and series_name in latest_curve.columns:
-                        err = make_error_frame(actual_regional_df, latest_curve, series_name)
-                        if not err.empty:
-                            table_df[f"{series_name} Latest Error MW"] = err["error_mw"]
-                            table_df[f"{series_name} Latest Abs Error MW"] = err["abs_error_mw"]
-                            table_df[f"{series_name} Latest Error %"] = err["pct_error"]
-
-                    if show_np4443 and not np4443_curve.empty and series_name in np4443_curve.columns:
-                        err = make_error_frame(actual_regional_df, np4443_curve, series_name)
-                        if not err.empty:
-                            table_df[f"{series_name} NP4-443 Error MW"] = err["error_mw"]
-                            table_df[f"{series_name} NP4-443 Abs Error MW"] = err["abs_error_mw"]
-                            table_df[f"{series_name} NP4-443 Error %"] = err["pct_error"]
-
-        if view_mode == "Table View":
-            st.subheader("Solar Table View")
-            st.dataframe(table_df.reset_index(), use_container_width=True, hide_index=True)
-
-        csv = table_df.reset_index().to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download graphed/table data as CSV",
-            data=csv,
-            file_name="ercot_solar_trader_view_v2.csv",
-            mime="text/csv",
-            key="solar_trader_download_v2"
-        )
-
-        with st.expander("Show graphed/table data"):
-            st.dataframe(table_df.reset_index(), use_container_width=True, hide_index=True)
-
+        # =====================================================
+        # DEBUG
+        # =====================================================
         with st.expander("Debug info"):
-            st.write(f"Actual endpoint: {actual_endpoint}")
-            st.write(f"Intra-hour endpoint: {intrahour_endpoint}")
-            st.write(f"NP4-443 endpoint: {np4443_endpoint}")
-            st.write(f"Actual rows returned: {len(actual_raw):,}")
-            st.write(f"Intra-hour rows returned: {len(intrahour_raw):,}")
-            st.write(f"NP4-443 rows returned: {len(np4443_raw):,}")
-            st.write(f"Actual timestamp column: {actual_time_col}")
-            st.write(f"Intra-hour posted column: {intrahour_posted_col}")
-            st.write(f"Intra-hour target column: {intrahour_target_col}")
-            st.write("NP4-443 raw columns:")
-            st.write(list(np4443_raw.columns))
-            if not np4443_long.empty:
-                st.write("NP4-443 models:")
-                st.write(sorted(np4443_long["model"].dropna().astype(str).unique().tolist()))
+            st.write("Feed status:")
+            st.write({
+                "np4746_ok": actual_res["ok"],
+                "np4745_ok": hourly_res["ok"],
+                "np4443_ok": model_status_res["ok"],
+            })
+
+            if actual_res["endpoint"]:
+                st.write(f"NP4-746 endpoint: {actual_res['endpoint']}")
+            if hourly_res["endpoint"]:
+                st.write(f"NP4-745 endpoint: {hourly_res['endpoint']}")
+            if model_status_res["endpoint"]:
+                st.write(f"NP4-443 endpoint: {model_status_res['endpoint']}")
+
+            if actual_error:
+                st.write(f"NP4-746 parse/load error: {actual_error}")
+            if hourly_error:
+                st.write(f"NP4-745 parse/load error: {hourly_error}")
+            if load_np4443 and model_status_error:
+                st.write(f"NP4-443 parse/load error: {model_status_error}")
+            elif not load_np4443:
+                st.write("NP4-443 status: skipped")
+
+            if actual_res["ok"]:
+                st.write("NP4-746 columns:")
+                st.write(list(actual_res["df"].columns))
+            if hourly_res["ok"]:
+                st.write("NP4-745 columns:")
+                st.write(list(hourly_res["df"].columns))
+            if model_status_res["ok"]:
+                st.write("NP4-443 columns:")
+                st.write(list(model_status_res["df"].columns))
 
     except Exception as e:
         st.error(str(e))
 # -----------------------------
 # TAB 4 - NET LOAD DATA
 # -----------------------------
-elif page == "Load Forecast View":
+if page == "Load Forecast View":
     st.caption("ERCOT Intra-Hour Load Forecast by Weather Zone")
 
     LOAD_FORECAST_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np3-562-cd"
 
-    # ---------------------------------------------------
-    # API HELPERS
-    # ---------------------------------------------------
+# ---------------------------------------------------
+# API HELPERS
+# ---------------------------------------------------
     @st.cache_data(ttl=300)
     def get_product_metadata_tab4(product_url):
         r = requests.get(product_url, headers=get_headers(), timeout=60)
@@ -2678,9 +2997,9 @@ elif page == "Load Forecast View":
         cols = [f["name"] for f in fields]
         return pd.DataFrame(rows, columns=cols)
 
-    # ---------------------------------------------------
-    # HELPERS
-    # ---------------------------------------------------
+# ---------------------------------------------------
+# HELPERS
+# ---------------------------------------------------
     def detect_time_col_tab4(df):
         preferred = ["IntervalEnding", "intervalEnding", "timestamp", "datetime"]
         for c in preferred:
@@ -2766,9 +3085,9 @@ elif page == "Load Forecast View":
             return df
         return df[(df.index >= start_ts) & (df.index <= end_ts)].copy()
 
-    # ---------------------------------------------------
-    # CONTROLS
-    # ---------------------------------------------------
+# ---------------------------------------------------
+# CONTROLS
+# ---------------------------------------------------
     try:
         st.subheader("Display Controls")
 
@@ -2796,9 +3115,9 @@ elif page == "Load Forecast View":
         start_ts = ercot_now - pd.Timedelta(minutes=5)
         end_ts = ercot_now + pd.Timedelta(hours=2)
 
-        # ---------------------------------------------------
-        # LOAD DATA
-        # ---------------------------------------------------
+# ---------------------------------------------------
+# LOAD DATA
+ # ---------------------------------------------------
         endpoint = get_endpoint_tab4(LOAD_FORECAST_PRODUCT_URL)
         raw = load_report_tab4(endpoint, size=5000)
         curve = normalize_forecast_tab4(raw)
@@ -2834,9 +3153,9 @@ elif page == "Load Forecast View":
             st.warning("Select at least one region.")
             st.stop()
 
-        # ---------------------------------------------------
-        # GRAPH
-        # ---------------------------------------------------
+# ---------------------------------------------------
+ # GRAPH
+ # ---------------------------------------------------
         fig = go.Figure()
 
         for region in selected_regions:
@@ -2871,9 +3190,9 @@ elif page == "Load Forecast View":
 
         st.plotly_chart(fig, use_container_width=True, key="np3562_chart_final")
 
-        # ---------------------------------------------------
-        # DOWNLOAD / TABLE
-        # ---------------------------------------------------
+# ---------------------------------------------------
+# DOWNLOAD / TABLE
+ # ---------------------------------------------------
         export_df = curve[selected_regions].copy()
 
         st.download_button(
