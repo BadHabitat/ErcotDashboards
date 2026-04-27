@@ -6,6 +6,7 @@ import plotly.express as px
 import numpy as np
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
 
 # -----------------------------
 # CONFIG
