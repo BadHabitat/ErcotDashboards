@@ -2936,28 +2936,74 @@ elif page == "Solar Trader View":
 
     except Exception as e:
         st.error(str(e))
+
 # -----------------------------
-# TAB 4 - FORECAST VS ACTUALS
-# CHART 1: DAM Proxy (NP3-561) vs NP6-345
-# CHART 2: STLF (NP3-562) vs NP6-345
+# LOAD FORECAST VIEW
+# Simple trader-facing dashboard
+#
+# Separate charts:
+# 1) NP3-565 Load Forecast Model Weather
+# 2) NP3-562 Intra-Hour Load Forecast
+#
+# Features:
+# - No proxy forecast
+# - No actuals
+# - Region selector
+# - All regions overlay option
+# - Toggle to include/exclude ERCOT Total
+# - NP3-562 model selector
+# - NP3-562 inUseFlag == Y model highlighted
 # -----------------------------
+
 if page == "Load Forecast View":
-    st.caption("ERCOT Actuals vs DAM Proxy Forecast and STLF")
+    st.caption("ERCOT Load Forecasts")
 
     import pandas as pd
     import requests
     import plotly.graph_objects as go
 
-    SEVEN_DAY_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np3-561-cd"
-    SHORT_TERM_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np3-562-cd"
-    ACTUAL_LOAD_PRODUCT_URL = "https://api.ercot.com/api/public-reports/np6-345-cd"
+    # -----------------------------
+    # ERCOT REPORT URLS
+    # -----------------------------
 
-    # ---------------------------------------------------
+    NP3565_URL = "https://api.ercot.com/api/public-reports/np3-565-cd"
+    NP3562_URL = "https://api.ercot.com/api/public-reports/np3-562-cd"
+
+    REGION_LABELS = {
+        "systemTotal": "ERCOT Total",
+        "coast": "Coast",
+        "east": "East",
+        "farWest": "Far West",
+        "north": "North",
+        "northCentral": "North Central",
+        "southCentral": "South Central",
+        "southern": "South",
+        "west": "West",
+    }
+
+    REGION_ORDER = [
+        "systemTotal",
+        "coast",
+        "east",
+        "farWest",
+        "north",
+        "northCentral",
+        "southCentral",
+        "southern",
+        "west",
+    ]
+
+    # -----------------------------
     # API HELPERS
-    # ---------------------------------------------------
+    # -----------------------------
+
     @st.cache_data(ttl=300)
     def get_product_metadata(product_url):
-        r = requests.get(product_url, headers=get_headers(), timeout=60)
+        r = requests.get(
+            product_url,
+            headers=get_headers(),
+            timeout=60,
+        )
         r.raise_for_status()
         return r.json()
 
@@ -2971,16 +3017,17 @@ if page == "Load Forecast View":
             blob = f"{endpoint} {name}".lower()
 
             score = 0
+
             if endpoint:
-                score += 1
+                score += 10
             if "csv" in blob:
                 score += 5
+            if "json" in blob:
+                score += 3
             if "xml" in blob:
-                score -= 2
+                score -= 5
             if "zip" in blob:
-                score -= 2
-            if "report" in blob or "view" in blob or "data" in blob:
-                score += 2
+                score -= 5
 
             if score > best_score:
                 best_score = score
@@ -3010,7 +3057,7 @@ if page == "Load Forecast View":
             endpoint,
             headers=get_headers(),
             params={"size": size},
-            timeout=120
+            timeout=120,
         )
         r.raise_for_status()
 
@@ -3024,874 +3071,753 @@ if page == "Load Forecast View":
         cols = [f["name"] for f in fields]
         return pd.DataFrame(rows, columns=cols)
 
-    # ---------------------------------------------------
-    # HELPERS
-    # ---------------------------------------------------
-    def detect_time_col(df):
-        preferred = [
-            "IntervalEnding", "intervalEnding",
-            "HourEnding", "hourEnding",
-            "DeliveryDate", "OperDay",
-            "timestamp", "datetime", "Date", "Time"
-        ]
-        for c in preferred:
-            if c in df.columns:
-                return c
+    # -----------------------------
+    # CLEANING HELPERS
+    # -----------------------------
+
+    def get_col(df, target):
+        """
+        Case-insensitive column lookup.
+        """
+        target_lower = target.lower()
 
         for c in df.columns:
-            cl = c.lower()
-            if "interval" in cl and "ending" in cl:
-                return c
-            if "hour" in cl and "ending" in cl:
-                return c
-            if "time" in cl or "date" in cl:
+            if c.lower() == target_lower:
                 return c
 
         return None
 
-    def clean_region_name(raw_col):
-        s = str(raw_col).strip().replace("_", "").replace(" ", "").lower()
+    def clean_region_name(col):
+        key = str(col).replace("_", "").replace(" ", "").lower()
 
         mapping = {
-            "systemtotal": "ERCOT Total",
-            "ercottotal": "ERCOT Total",
-            "ercot": "ERCOT Total",
-            "total": "ERCOT Total",
-            "coast": "Coast",
-            "east": "East",
-            "farwest": "Far West",
-            "north": "North",
-            "northcentral": "North Central",
-            "southcentral": "South Central",
-            "southc": "South Central",
-            "southern": "South",
-            "south": "South",
-            "west": "West",
+            "systemtotal": "systemTotal",
+            "ercottotal": "systemTotal",
+            "total": "systemTotal",
+            "coast": "coast",
+            "east": "east",
+            "farwest": "farWest",
+            "north": "north",
+            "northcentral": "northCentral",
+            "southcentral": "southCentral",
+            "southern": "southern",
+            "south": "southern",
+            "west": "west",
         }
-        return mapping.get(s, str(raw_col).strip())
 
-    def detect_region_columns(df, exclude_extra=None):
-        exclude = {"Model", "InUseFlag", "DSTFlag", "PlotTime", "ActualTime"}
-        if exclude_extra:
-            exclude |= set(exclude_extra)
+        return mapping.get(key, col)
 
-        time_col = detect_time_col(df)
+    def make_hour_ending_timestamp(df):
+        """
+        ERCOT HourEnding 1 = hour starting 00:00.
 
-        region_cols = []
-        for c in df.columns:
-            if c == time_col or c in exclude:
-                continue
+        For plotting:
+        ForecastTime = deliveryDate + hourEnding - 1 hour.
+        """
+        out = df.copy()
 
-            s = pd.to_numeric(df[c], errors="coerce")
-            if s.notna().sum() > 0:
-                region_cols.append(c)
+        delivery_col = get_col(out, "deliveryDate")
+        hour_col = get_col(out, "hourEnding")
 
-        return region_cols
+        if delivery_col is None or hour_col is None:
+            raise ValueError(
+                f"Missing deliveryDate/hourEnding columns. Columns: {list(out.columns)}"
+            )
 
-    def collapse_duplicate_columns(df):
-        if df.empty:
-            return df
+        out[delivery_col] = pd.to_datetime(out[delivery_col], errors="coerce")
 
-        out = pd.DataFrame(index=df.index)
-        unique_cols = list(dict.fromkeys(df.columns))
+        hour_num = (
+            out[hour_col]
+            .astype(str)
+            .str.extract(r"(\d+)")
+            .astype(float)
+        )
 
-        for c in unique_cols:
-            same_cols = df.loc[:, df.columns == c]
-            if same_cols.shape[1] == 1:
-                out[c] = same_cols.iloc[:, 0]
-            else:
-                out[c] = same_cols.bfill(axis=1).iloc[:, 0]
+        out["ForecastTime"] = (
+            out[delivery_col] +
+            pd.to_timedelta(hour_num[0] - 1, unit="h")
+        )
 
         return out
 
-    def normalize_forecast(df):
-        time_col = detect_time_col(df)
-        if not time_col:
-            raise ValueError(f"Could not detect forecast time column. Columns: {list(df.columns)}")
-
-        region_cols = detect_region_columns(df)
-        if not region_cols:
-            raise ValueError(f"Could not detect forecast region columns. Columns: {list(df.columns)}")
-
+    def add_forecast_time(df):
+        """
+        Handles both common ERCOT forecast time shapes:
+        - intervalEnding
+        - deliveryDate + hourEnding
+        """
         out = df.copy()
-        out[time_col] = pd.to_datetime(out[time_col], errors="coerce")
 
-        if "InUseFlag" in out.columns:
-            active = out[out["InUseFlag"].astype(str).str.upper() == "Y"].copy()
+        interval_col = get_col(out, "intervalEnding")
+        delivery_col = get_col(out, "deliveryDate")
+        hour_col = get_col(out, "hourEnding")
+
+        if interval_col is not None:
+            out["ForecastTime"] = pd.to_datetime(
+                out[interval_col],
+                errors="coerce",
+            )
+
+        elif delivery_col is not None and hour_col is not None:
+            out = make_hour_ending_timestamp(out)
+
+        else:
+            raise ValueError(
+                f"No usable time columns found. Columns: {list(out.columns)}"
+            )
+
+        return out
+
+    def normalize_region_columns(df):
+        """
+        Standardizes ERCOT region columns into:
+        systemTotal, coast, east, farWest, north, northCentral,
+        southCentral, southern, west.
+        """
+        out = df.copy()
+        region_cols = []
+
+        for c in list(out.columns):
+            standard_name = clean_region_name(c)
+
+            if standard_name in REGION_ORDER:
+                out[c] = pd.to_numeric(out[c], errors="coerce")
+                out = out.rename(columns={c: standard_name})
+                region_cols.append(standard_name)
+
+        region_cols = list(dict.fromkeys(region_cols))
+
+        if not region_cols:
+            raise ValueError(
+                f"No region/load columns found. Columns: {list(df.columns)}"
+            )
+
+        return out, region_cols
+
+    def collapse_duplicate_region_columns(df, region_cols):
+        """
+        Handles duplicate standardized columns after renaming.
+        """
+        collapsed = pd.DataFrame(index=df.index)
+        collapsed["ForecastTime"] = df["ForecastTime"]
+
+        for c in region_cols:
+            same_cols = df.loc[:, df.columns == c]
+
+            if same_cols.shape[1] == 1:
+                collapsed[c] = same_cols.iloc[:, 0]
+            else:
+                collapsed[c] = same_cols.bfill(axis=1).iloc[:, 0]
+
+        return collapsed
+
+    def clean_np3565_forecast(df):
+        """
+        NP3-565:
+        Uses active model rows only if inUseFlag exists.
+        Returns index = ForecastTime, columns = region MWs.
+        """
+        out = df.copy()
+
+        in_use_col = get_col(out, "inUseFlag")
+
+        if in_use_col is not None:
+            active = out[
+                out[in_use_col]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .eq("Y")
+            ].copy()
+
             if not active.empty:
                 out = active
 
-        keep_cols = [time_col] + region_cols
-        out = out[keep_cols].copy()
+        out = add_forecast_time(out)
+        out, region_cols = normalize_region_columns(out)
 
-        rename_map = {c: clean_region_name(c) for c in region_cols}
-        out = out.rename(columns=rename_map)
-        out = collapse_duplicate_columns(out)
-
-        for c in out.columns:
-            if c != time_col:
-                out[c] = pd.to_numeric(out[c], errors="coerce")
+        out = out[["ForecastTime"] + region_cols].copy()
+        out = collapse_duplicate_region_columns(out, region_cols)
 
         out = (
-            out.dropna(subset=[time_col])
-            .sort_values(time_col)
-            .drop_duplicates(subset=[time_col], keep="last")
-            .set_index(time_col)
+            out
+            .dropna(subset=["ForecastTime"])
+            .sort_values("ForecastTime")
+            .drop_duplicates(subset=["ForecastTime"], keep="last")
+            .set_index("ForecastTime")
             .sort_index()
         )
 
-        out.index.name = "ForecastTime"
         return out
 
-    def normalize_actual_load(df):
-        time_col = detect_time_col(df)
-        if not time_col:
-            raise ValueError(f"Could not detect NP6-345 time column. Columns: {list(df.columns)}")
-
-        region_cols = detect_region_columns(df)
-        if not region_cols:
-            raise ValueError(f"Could not detect NP6-345 region columns. Columns: {list(df.columns)}")
-
+    def clean_np3562_forecast(df):
+        """
+        NP3-562:
+        Keeps all model rows so the user can select model(s).
+        Keeps inUseFlag so active model can be highlighted.
+        Returns dataframe with ForecastTime column, model, inUseFlag, and region MWs.
+        """
         out = df.copy()
-        out[time_col] = pd.to_datetime(out[time_col], errors="coerce")
 
-        keep_cols = [time_col] + region_cols
+        out = add_forecast_time(out)
+        out, region_cols = normalize_region_columns(out)
+
+        model_col = get_col(out, "model")
+        in_use_col = get_col(out, "inUseFlag")
+
+        if model_col is None:
+            out["model"] = "Unknown"
+            model_col = "model"
+
+        if in_use_col is None:
+            out["inUseFlag"] = "N"
+            in_use_col = "inUseFlag"
+
+        keep_cols = ["ForecastTime", model_col, in_use_col] + region_cols
         out = out[keep_cols].copy()
 
-        rename_map = {c: clean_region_name(c) for c in region_cols}
-        out = out.rename(columns=rename_map)
-        out = collapse_duplicate_columns(out)
-
-        for c in out.columns:
-            if c != time_col:
-                out[c] = pd.to_numeric(out[c], errors="coerce")
-
-        out = (
-            out.dropna(subset=[time_col])
-            .sort_values(time_col)
-            .drop_duplicates(subset=[time_col], keep="last")
-            .set_index(time_col)
-            .sort_index()
+        out = out.rename(
+            columns={
+                model_col: "model",
+                in_use_col: "inUseFlag",
+            }
         )
 
-        # Plot actuals at the start of the hour represented.
-        out.index.name = "HourEnding"
-        out["PlotTime"] = out.index - pd.Timedelta(hours=1)
+        out["model"] = (
+            out["model"]
+            .astype(str)
+            .str.strip()
+        )
 
-        numeric_cols = [c for c in out.columns if c != "PlotTime"]
-        out = out.dropna(subset=numeric_cols, how="all").copy()
+        out["inUseFlag"] = (
+            out["inUseFlag"]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
 
-        return out
+        # Collapse duplicate standardized region columns while preserving metadata
+        base_cols = ["ForecastTime", "model", "inUseFlag"]
+        collapsed = out[base_cols].copy()
 
-    def align_index(df, start_ts, end_ts, use_plot_time=False):
-        if df.empty:
-            return df
+        for c in region_cols:
+            same_cols = out.loc[:, out.columns == c]
 
-        if use_plot_time and "PlotTime" in df.columns:
-            return df[(df["PlotTime"] >= start_ts) & (df["PlotTime"] <= end_ts)].copy()
+            if same_cols.shape[1] == 1:
+                collapsed[c] = same_cols.iloc[:, 0]
+            else:
+                collapsed[c] = same_cols.bfill(axis=1).iloc[:, 0]
 
-        return df[(df.index >= start_ts) & (df.index <= end_ts)].copy()
+        collapsed = (
+            collapsed
+            .dropna(subset=["ForecastTime"])
+            .sort_values(["model", "ForecastTime"])
+        )
 
-    def get_available_regions(*dfs):
-        preferred_order = [
-            "ERCOT Total",
-            "Coast",
-            "East",
-            "Far West",
-            "North",
-            "North Central",
-            "South Central",
-            "South",
-            "West",
+        return collapsed, region_cols
+
+    # -----------------------------
+    # WINDOW HELPERS
+    # -----------------------------
+
+    def get_window_bounds(window):
+        now = pd.Timestamp.now(tz="America/Chicago").tz_localize(None).floor("h")
+
+        if window == "Next 2 Hours":
+            start = now
+            end = now + pd.Timedelta(hours=2)
+        elif window == "Next 4 Hours":
+            start = now
+            end = now + pd.Timedelta(hours=4)
+        elif window == "Next 6 Hours":
+            start = now
+            end = now + pd.Timedelta(hours=6)
+        elif window == "Next 12 Hours":
+            start = now
+            end = now + pd.Timedelta(hours=12)
+        elif window == "Next 24 Hours":
+            start = now
+            end = now + pd.Timedelta(hours=24)
+        elif window == "Next 48 Hours":
+            start = now
+            end = now + pd.Timedelta(hours=48)
+        elif window == "Today":
+            start = now.normalize()
+            end = start + pd.Timedelta(days=1)
+        elif window == "Tomorrow":
+            start = now.normalize() + pd.Timedelta(days=1)
+            end = start + pd.Timedelta(days=1)
+        else:
+            start = None
+            end = None
+
+        return start, end
+
+    def filter_window_indexed(df, window):
+        start, end = get_window_bounds(window)
+
+        if start is None or end is None:
+            return df.copy()
+
+        return df[(df.index >= start) & (df.index <= end)].copy()
+
+    def filter_window_column(df, window, time_col="ForecastTime"):
+        start, end = get_window_bounds(window)
+
+        if start is None or end is None:
+            return df.copy()
+
+        return df[(df[time_col] >= start) & (df[time_col] <= end)].copy()
+
+    # -----------------------------
+    # REGION SELECTION HELPER
+    # -----------------------------
+
+    def build_regions_to_plot(common_regions, region_mode, selected_region, include_total):
+        """
+        Controls whether ERCOT Total is included in both charts.
+        """
+        if region_mode == "All Regions Overlay":
+            regions = common_regions.copy()
+        else:
+            regions = [selected_region]
+
+        if not include_total:
+            regions = [r for r in regions if r != "systemTotal"]
+
+        return regions
+
+    # -----------------------------
+    # CHART HELPERS
+    # -----------------------------
+
+    def make_np3565_chart(df, title, regions, height=525):
+        fig = go.Figure()
+
+        if not regions:
+            st.info("No regions selected. Enable ERCOT Total or select a region.")
+            return
+
+        for r in regions:
+            if r not in df.columns:
+                continue
+
+            fig.add_trace(
+                go.Scatter(
+                    x=df.index,
+                    y=df[r],
+                    mode="lines",
+                    name=REGION_LABELS.get(r, r),
+                    line=dict(
+                        width=4 if r == "systemTotal" else 2,
+                        shape="hv",
+                    ),
+                    opacity=1.0 if r == "systemTotal" else 0.85,
+                    hovertemplate=(
+                        f"{REGION_LABELS.get(r, r)}<br>"
+                        "Time: %{x}<br>"
+                        "MW: %{y:,.0f}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+        fig.update_layout(
+            title=title,
+            height=height,
+            hovermode="x unified",
+            xaxis_title="Time",
+            yaxis_title="MW",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0,
+            ),
+            margin=dict(l=40, r=20, t=70, b=40),
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    def make_np3562_chart(df, title, regions, selected_models, height=525):
+        fig = go.Figure()
+
+        if not regions:
+            st.info("No regions selected. Enable ERCOT Total or select a region.")
+            return
+
+        plot_df = df[df["model"].isin(selected_models)].copy()
+
+        if plot_df.empty:
+            st.info("No NP3-562 data available for the selected model/window.")
+            return
+
+        for model in selected_models:
+            model_df = plot_df[plot_df["model"] == model].copy()
+
+            if model_df.empty:
+                continue
+
+            is_active = (
+                model_df["inUseFlag"]
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .eq("Y")
+                .any()
+            )
+
+            for r in regions:
+                if r not in model_df.columns:
+                    continue
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=model_df["ForecastTime"],
+                        y=model_df[r],
+                        mode="lines",
+                        name=(
+                            f"{REGION_LABELS.get(r, r)} | {model}"
+                            + (" | In Use" if is_active else "")
+                        ),
+                        line=dict(
+                            width=5 if is_active else 2,
+                            dash="solid" if is_active else "dot",
+                            shape="hv",
+                        ),
+                        opacity=1.0 if is_active else 0.45,
+                        hovertemplate=(
+                            f"{REGION_LABELS.get(r, r)}<br>"
+                            f"Model: {model}<br>"
+                            f"In Use: {'Y' if is_active else 'N'}<br>"
+                            "Time: %{x}<br>"
+                            "MW: %{y:,.0f}"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+
+        fig.update_layout(
+            title=title,
+            height=height,
+            hovermode="x unified",
+            xaxis_title="Time",
+            yaxis_title="MW",
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="left",
+                x=0,
+            ),
+            margin=dict(l=40, r=20, t=70, b=40),
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    # -----------------------------
+    # MAIN APP
+    # -----------------------------
+
+    try:
+        # Load reports
+        endpoint_565 = get_endpoint(NP3565_URL)
+        endpoint_562 = get_endpoint(NP3562_URL)
+
+        raw_565 = load_report(endpoint_565, size=10000)
+        raw_562 = load_report(endpoint_562, size=10000)
+
+        df_565 = clean_np3565_forecast(raw_565)
+        df_562, np3562_region_cols = clean_np3562_forecast(raw_562)
+
+        common_regions = [
+            r for r in REGION_ORDER
+            if r in df_565.columns and r in df_562.columns
         ]
 
-        found = set()
-
-        for df in dfs:
-            if df is None or df.empty:
-                continue
-            for c in df.columns:
-                if c in ["PlotTime", "ActualTime"]:
-                    continue
-                try:
-                    if pd.to_numeric(df[c], errors="coerce").notna().sum() > 0:
-                        found.add(clean_region_name(c))
-                except Exception:
-                    pass
-
-        ordered = [r for r in preferred_order if r in found]
-        extras = sorted([r for r in found if r not in preferred_order])
-        return ordered + extras
-
-    def get_latest_actual_plot_time(actual_df):
-        if actual_df.empty or "PlotTime" not in actual_df.columns:
-            return None
-        base = actual_df.dropna(subset=[c for c in actual_df.columns if c != "PlotTime"], how="all")
-        if base.empty:
-            return None
-        return base["PlotTime"].max()
-
-    def get_latest_actual_hour_ending(actual_df):
-        if actual_df.empty:
-            return None
-        base = actual_df.dropna(subset=[c for c in actual_df.columns if c != "PlotTime"], how="all")
-        if base.empty:
-            return None
-        return base.index.max()
-
-    def get_actuals_status_label(latest_hour_ending, now_ts):
-        if latest_hour_ending is None:
-            return "No actuals"
-
-        age = now_ts - latest_hour_ending
-        if age <= pd.Timedelta(hours=1):
-            return "Current"
-        if age <= pd.Timedelta(hours=2):
-            return "Slightly Delayed"
-        return "Stale"
-
-    def format_hour_label(ts):
-        if ts is None or pd.isna(ts):
-            return "N/A"
-        return pd.Timestamp(ts).strftime("%Y-%m-%d HE %H")
-
-    def add_series_trace(fig, x, y, name, width, dash, shape, opacity, hover_label, customdata=None, mode="lines"):
-        kwargs = dict(
-            x=x,
-            y=y,
-            mode=mode,
-            name=name,
-            line=dict(width=width, dash=dash, shape=shape),
-            opacity=opacity,
-        )
-
-        if customdata is not None:
-            kwargs["customdata"] = customdata
-            kwargs["hovertemplate"] = (
-                f"{hover_label}<br>"
-                "Hour Start: %{x}<br>"
-                "Hour Ending: %{customdata}<br>"
-                "MW: %{y:,.0f}<extra></extra>"
-            )
-        else:
-            kwargs["hovertemplate"] = (
-                f"{hover_label}<br>"
-                "Time: %{x}<br>"
-                "MW: %{y:,.0f}<extra></extra>"
+        if not common_regions:
+            raise ValueError(
+                f"No common regions found. "
+                f"NP3-565 columns: {list(df_565.columns)}. "
+                f"NP3-562 columns: {list(df_562.columns)}."
             )
 
-        fig.add_trace(go.Scatter(**kwargs))
-
-    def align_actuals_to_stlf_grid(actual_df, stlf_df, region):
-        if actual_df.empty or stlf_df.empty or region not in actual_df.columns or region not in stlf_df.columns:
-            return pd.DataFrame()
-
-        base = actual_df[["PlotTime", region]].copy()
-        base = base.dropna(subset=[region]).sort_values("PlotTime")
-        if base.empty:
-            return pd.DataFrame()
-
-        latest_actual_ts = base["PlotTime"].max()
-
-        left = pd.DataFrame({"ForecastTime": stlf_df.index})
-        left = left[left["ForecastTime"] <= latest_actual_ts].copy()
-        if left.empty:
-            return pd.DataFrame()
-
-        right = base.rename(columns={"PlotTime": "ActualTime", region: "Actual"}).sort_values("ActualTime")
-
-        aligned = pd.merge_asof(
-            left.sort_values("ForecastTime"),
-            right,
-            left_on="ForecastTime",
-            right_on="ActualTime",
-            direction="backward"
+        # NP3-562 model detection
+        df_562["model"] = (
+            df_562["model"]
+            .astype(str)
+            .str.strip()
         )
 
-        aligned["Forecast"] = stlf_df[region].reindex(aligned["ForecastTime"]).values
-        aligned = aligned.dropna(subset=["Forecast", "Actual"])
+        df_562["inUseFlag"] = (
+            df_562["inUseFlag"]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
 
-        return aligned
+        available_models = sorted(
+            df_562["model"]
+            .dropna()
+            .unique()
+            .tolist()
+        )
 
-    def style_compare_table(df, threshold_pct):
-        def row_style(row):
-            styles = [""] * len(row)
-            error_pct = row.get("Error_Pct")
-            if pd.notna(error_pct) and abs(error_pct) > threshold_pct:
-                for i, col in enumerate(df.columns):
-                    if col in ["Forecast", "Actual", "Error_MW", "Error_Pct"]:
-                        styles[i] = "background-color: #ffdddd; color: #900; font-weight: 600;"
-            return styles
+        active_models = sorted(
+            df_562.loc[
+                df_562["inUseFlag"].eq("Y"),
+                "model",
+            ]
+            .dropna()
+            .unique()
+            .tolist()
+        )
 
-        styled = df.style.apply(row_style, axis=1)
+        default_models = active_models if active_models else available_models[:1]
 
-        fmt = {}
-        for col in df.columns:
-            if col in ["Forecast", "Actual", "Error_MW"]:
-                fmt[col] = "{:,.0f}"
-            elif col == "Error_Pct":
-                fmt[col] = "{:.1f}%"
+        # -----------------------------
+        # CONTROLS
+        # -----------------------------
 
-        return styled.format(fmt)
-
-    def build_hourly_compare_table(forecast_df, actual_df, regions, label):
-        rows = []
-        if forecast_df.empty or actual_df.empty:
-            return pd.DataFrame()
-
-        for region in regions:
-            if region in forecast_df.columns and region in actual_df.columns:
-                merged = pd.merge_asof(
-                    pd.DataFrame({"Time": forecast_df.index}).sort_values("Time"),
-                    actual_df[["PlotTime", region]].rename(columns={region: "Actual"}).dropna().sort_values("PlotTime"),
-                    left_on="Time",
-                    right_on="PlotTime",
-                    direction="backward"
-                )
-
-                merged["Forecast"] = forecast_df[region].reindex(merged["Time"]).values
-                merged["Error_MW"] = merged["Forecast"] - merged["Actual"]
-                merged["Error_Pct"] = (merged["Error_MW"] / merged["Actual"].replace(0, pd.NA)) * 100
-                merged["Region"] = region
-                merged["ForecastSet"] = label
-                merged = merged.dropna(subset=["Forecast", "Actual"])
-
-                if not merged.empty:
-                    rows.append(
-                        merged[["Time", "ForecastSet", "Region", "Forecast", "Actual", "Error_MW", "Error_Pct"]]
-                    )
-
-        if rows:
-            return pd.concat(rows, ignore_index=True).sort_values(["Time", "Region"])
-        return pd.DataFrame()
-
-    def build_stlf_compare_table(stlf_df, actual_df, regions):
-        rows = []
-        if stlf_df.empty or actual_df.empty:
-            return pd.DataFrame()
-
-        for region in regions:
-            aligned = align_actuals_to_stlf_grid(actual_df, stlf_df, region)
-            if not aligned.empty:
-                aligned["Error_MW"] = aligned["Forecast"] - aligned["Actual"]
-                aligned["Error_Pct"] = (aligned["Error_MW"] / aligned["Actual"].replace(0, pd.NA)) * 100
-                aligned["Region"] = region
-                rows.append(
-                    aligned.rename(columns={"ForecastTime": "Time"})[
-                        ["Time", "Region", "Forecast", "Actual", "Error_MW", "Error_Pct"]
-                    ]
-                )
-
-        if rows:
-            return pd.concat(rows, ignore_index=True).sort_values(["Time", "Region"])
-        return pd.DataFrame()
-
-    def make_window(name, now_ts):
-        today_start = now_ts.normalize()
-        hour_floor = now_ts.floor("h")
-
-        if name == "Today":
-            return today_start, today_start + pd.Timedelta(days=1)
-        if name == "Next 24 Hours":
-            return hour_floor, hour_floor + pd.Timedelta(hours=24)
-        if name == "Next 48 Hours":
-            return hour_floor, hour_floor + pd.Timedelta(hours=48)
-        if name == "Next 2 Hours":
-            return now_ts - pd.Timedelta(hours=1), now_ts + pd.Timedelta(hours=1)
-        if name == "Next 4 Hours":
-            return now_ts - pd.Timedelta(hours=1), now_ts + pd.Timedelta(hours=3)
-        if name == "Next 6 Hours":
-            return now_ts - pd.Timedelta(hours=1), now_ts + pd.Timedelta(hours=5)
-
-        return today_start, today_start + pd.Timedelta(days=1)
-
-    # ---------------------------------------------------
-    # MAIN
-    # ---------------------------------------------------
-    try:
-        st.subheader("Display Controls")
-
-        # Safe placeholder before data load
-        available_regions = ["ERCOT Total"]
-
-        # -------- controls that do not require loaded data
         with st.container(border=True):
-            top1, top2, top3, top4 = st.columns([1.1, 1.1, 1.0, 1.0])
+            c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.1, 1.0])
 
-            with top1:
-                show_actuals = st.toggle(
-                    "Show Actuals",
-                    value=True,
-                    key="tab4_show_actuals"
-                )
-
-            with top2:
-                miss_threshold_pct = st.selectbox(
-                    "Miss Threshold %",
-                    options=[5, 10, 15, 20],
-                    index=1,
-                    key="tab4_miss_threshold_pct"
-                )
-
-            with top3:
-                day_ahead_window = st.selectbox(
-                    "DAM Proxy Window",
-                    options=["Today", "Next 24 Hours", "Next 48 Hours"],
+            with c1:
+                region_mode = st.selectbox(
+                    "Region Display",
+                    options=[
+                        "Single Region",
+                        "All Regions Overlay",
+                    ],
                     index=0,
-                    key="tab4_da_window"
+                    key="load_forecast_region_mode",
                 )
 
-            with top4:
-                stlf_window = st.selectbox(
-                    "STLF Window",
-                    options=["Next 2 Hours", "Next 4 Hours", "Next 6 Hours"],
+            with c2:
+                selectable_regions = [
+                    r for r in common_regions
+                    if r != "systemTotal"
+                ]
+
+                if not selectable_regions:
+                    selectable_regions = common_regions
+
+                selected_region = st.selectbox(
+                    "Region",
+                    options=selectable_regions,
+                    format_func=lambda x: REGION_LABELS.get(x, x),
+                    index=0,
+                    key="load_forecast_region",
+                    disabled=(region_mode == "All Regions Overlay"),
+                )
+
+            with c3:
+                include_total = st.checkbox(
+                    "Include ERCOT Total",
+                    value=(region_mode == "Single Region"),
+                    key="include_ercot_total",
+                    help="Turn this off to make individual region lines easier to see.",
+                )
+
+            with c4:
+                chart_height = st.selectbox(
+                    "Chart Height",
+                    options=[450, 525, 600, 700],
                     index=1,
-                    key="tab4_stlf_window"
+                    key="load_forecast_chart_height",
                 )
 
-            with st.expander("Advanced controls", expanded=False):
-                adv1, adv2, adv3, adv4 = st.columns(4)
+        with st.container(border=True):
+            w1, w2 = st.columns(2)
 
-                with adv1:
-                    chart_height = st.selectbox(
-                        "Chart Height",
-                        options=[450, 550, 650, 750],
-                        index=1,
-                        key="tab4_chart_height"
-                    )
+            with w1:
+                np3565_window = st.selectbox(
+                    "NP3-565 Window",
+                    options=[
+                        "Today",
+                        "Tomorrow",
+                        "Next 24 Hours",
+                        "Next 48 Hours",
+                        "All Available",
+                    ],
+                    index=0,
+                    key="np3565_window",
+                )
 
-                with adv2:
-                    show_tables = st.toggle(
-                        "Show Comparison Tables",
-                        value=True,
-                        key="tab4_show_tables"
-                    )
+            with w2:
+                np3562_window = st.selectbox(
+                    "NP3-562 Window",
+                    options=[
+                        "Next 2 Hours",
+                        "Next 4 Hours",
+                        "Next 6 Hours",
+                        "Next 12 Hours",
+                        "Next 24 Hours",
+                        "All Available",
+                    ],
+                    index=2,
+                    key="np3562_window",
+                )
 
-                with adv3:
-                    forecast_total_width = st.selectbox(
-                        "Forecast Total Width",
-                        options=[2, 3, 4, 5],
-                        index=1,
-                        key="tab4_forecast_total_width"
-                    )
-
-                with adv4:
-                    actual_total_width = st.selectbox(
-                        "Actual Total Width",
-                        options=[2, 3, 4, 5, 6],
-                        index=2,
-                        key="tab4_actual_total_width"
-                    )
-
-                adv5, adv6, adv7, adv8 = st.columns(4)
-
-                with adv5:
-                    forecast_zone_width = st.selectbox(
-                        "Forecast Zone Width",
-                        options=[1, 1.5, 2, 2.5],
-                        index=1,
-                        key="tab4_forecast_zone_width"
-                    )
-
-                with adv6:
-                    actual_zone_width = st.selectbox(
-                        "Actual Zone Width",
-                        options=[1.5, 2, 2.5, 3],
-                        index=1,
-                        key="tab4_actual_zone_width"
-                    )
-
-                with adv7:
-                    forecast_opacity = st.selectbox(
-                        "Forecast Opacity",
-                        options=[0.4, 0.55, 0.65, 0.75, 1.0],
-                        index=2,
-                        key="tab4_forecast_opacity"
-                    )
-
-                with adv8:
-                    actual_opacity = st.selectbox(
-                        "Actual Opacity",
-                        options=[0.7, 0.85, 1.0],
-                        index=2,
-                        key="tab4_actual_opacity"
-                    )
-
-                adv9, adv10 = st.columns(2)
-
-                with adv9:
-                    show_debug = st.toggle(
-                        "Show Debug",
-                        value=False,
-                        key="tab4_show_debug"
-                    )
-
-                with adv10:
-                    freeze_to_last_completed_hour = st.toggle(
-                        "Conservative Actual Cutoff",
-                        value=True,
-                        key="tab4_conservative_actual_cutoff"
-                    )
-
-        # fixed trader-sensible styling
-        forecast_dash = "dash"
-        forecast_shape = "hv"
-        actual_dash = "solid"
-        actual_shape = "hv"
-        actual_mode = "lines"
-
-        ercot_now = pd.Timestamp.now(tz="America/Chicago").tz_localize(None).floor("5min")
-
-        # -------- data load
-        endpoint_561 = get_endpoint(SEVEN_DAY_PRODUCT_URL)
-        endpoint_562 = get_endpoint(SHORT_TERM_PRODUCT_URL)
-        endpoint_actual = get_endpoint(ACTUAL_LOAD_PRODUCT_URL)
-
-        raw_561 = load_report(endpoint_561, size=10000)
-        raw_562 = load_report(endpoint_562, size=10000)
-        raw_actual = load_report(endpoint_actual, size=10000)
-
-        seven_day_curve = normalize_forecast(raw_561)
-        short_term_curve = normalize_forecast(raw_562)
-        actual_curve = normalize_actual_load(raw_actual)
-
-        file_latest_actual_plot_time = get_latest_actual_plot_time(actual_curve)
-
-        if freeze_to_last_completed_hour:
-            latest_allowed_plot_time = ercot_now.floor("h") - pd.Timedelta(hours=1)
-        else:
-            latest_allowed_plot_time = ercot_now.floor("h")
-
-        if file_latest_actual_plot_time is not None:
-            latest_actual_plot_time = min(file_latest_actual_plot_time, latest_allowed_plot_time)
-        else:
-            latest_actual_plot_time = latest_allowed_plot_time
-
-        actual_curve = actual_curve[
-            actual_curve["PlotTime"] <= latest_actual_plot_time
-        ].copy()
-
-        latest_actual_hour_ending = latest_actual_plot_time + pd.Timedelta(hours=1)
-        actuals_status = get_actuals_status_label(latest_actual_hour_ending, ercot_now)
-
-        # -------- now that data exists, build available regions
-        available_regions = get_available_regions(seven_day_curve, short_term_curve, actual_curve)
-
-        # -------- region controls that require loaded data
-        st.markdown("### Region Selection")
-        reg1, reg2 = st.columns(2)
-
-        with reg1:
-            primary_region = st.selectbox(
-                "Primary Region",
-                options=available_regions,
-                index=available_regions.index("ERCOT Total") if "ERCOT Total" in available_regions else 0,
-                key="tab4_primary_region"
+        with st.container(border=True):
+            selected_models = st.multiselect(
+                "NP3-562 Models",
+                options=available_models,
+                default=default_models,
+                key="np3562_selected_models",
             )
 
-        with reg2:
-            comparison_region = st.selectbox(
-                "Comparison Region",
-                options=["None"] + [r for r in available_regions if r != primary_region],
-                index=0,
-                key="tab4_comparison_region"
-            )
+            if active_models:
+                st.caption(
+                    "Active NP3-562 model from inUseFlag: "
+                    + ", ".join(active_models)
+                )
+            else:
+                st.caption("No active NP3-562 model found from inUseFlag.")
 
-        regions_to_plot = [primary_region]
-        if comparison_region != "None":
-            regions_to_plot.append(comparison_region)
+        if not selected_models:
+            selected_models = default_models
 
-        # -------- windows
-        da_start_ts, da_end_ts = make_window(day_ahead_window, ercot_now)
-        stlf_start_ts, stlf_end_ts = make_window(stlf_window, ercot_now)
-
-        seven_day_plot = align_index(seven_day_curve, da_start_ts, da_end_ts)
-        short_term_plot = align_index(short_term_curve, stlf_start_ts, stlf_end_ts)
-
-        actual_da_plot_end = min(da_end_ts, latest_actual_plot_time)
-        actual_stlf_plot_end = min(stlf_end_ts, latest_actual_plot_time)
-
-        actual_da_plot = align_index(
-            actual_curve,
-            da_start_ts - pd.Timedelta(hours=1),
-            actual_da_plot_end,
-            use_plot_time=True
+        # Region plotting logic
+        regions_to_plot = build_regions_to_plot(
+            common_regions=common_regions,
+            region_mode=region_mode,
+            selected_region=selected_region,
+            include_total=include_total,
         )
 
-        actual_stlf_plot = align_index(
-            actual_curve,
-            stlf_start_ts - pd.Timedelta(hours=1),
-            actual_stlf_plot_end,
-            use_plot_time=True
-        )
+        if region_mode == "All Regions Overlay":
+            region_title = "All Regions"
+            if not include_total:
+                region_title = "All Individual Regions"
+        else:
+            if include_total:
+                regions_to_plot = list(dict.fromkeys(["systemTotal", selected_region]))
+                region_title = f"ERCOT Total + {REGION_LABELS.get(selected_region, selected_region)}"
+            else:
+                region_title = REGION_LABELS.get(selected_region, selected_region)
 
-        # ---------------------------------------------------
+        # Filter windows
+        np3565_plot = filter_window_indexed(df_565, np3565_window)
+        np3562_plot = filter_window_column(df_562, np3562_window)
+
+        # -----------------------------
         # STATUS STRIP
-        # ---------------------------------------------------
+        # -----------------------------
+
         s1, s2, s3, s4 = st.columns(4)
+
         with s1:
-            st.metric("Primary Region", primary_region)
+            st.metric("Region View", region_title)
+
         with s2:
-            st.metric("Comparison Region", comparison_region)
+            st.metric("Regions Plotted", len(regions_to_plot))
+
         with s3:
-            st.metric("Latest Actual HE", format_hour_label(latest_actual_hour_ending))
+            st.metric("NP3-562 Models", len(selected_models))
+
         with s4:
-            st.metric("Actuals Status", actuals_status)
-
-        # ---------------------------------------------------
-        # CHART 1 - DAM PROXY VS ACTUAL
-        # ---------------------------------------------------
-        fig_da = go.Figure()
-
-        for region in regions_to_plot:
-            if region in seven_day_plot.columns:
-                width = float(forecast_total_width) if region == "ERCOT Total" else float(forecast_zone_width)
-                add_series_trace(
-                    fig_da,
-                    x=seven_day_plot.index,
-                    y=seven_day_plot[region],
-                    name=f"{region} DAM Proxy",
-                    width=width,
-                    dash=forecast_dash,
-                    shape=forecast_shape,
-                    opacity=float(forecast_opacity),
-                    hover_label=f"{region} DAM Proxy",
-                    mode="lines"
-                )
-
-            if show_actuals and not actual_da_plot.empty and region in actual_da_plot.columns:
-                width = float(actual_total_width) if region == "ERCOT Total" else float(actual_zone_width)
-                add_series_trace(
-                    fig_da,
-                    x=actual_da_plot["PlotTime"],
-                    y=actual_da_plot[region],
-                    name=f"{region} Actual",
-                    width=width,
-                    dash=actual_dash,
-                    shape=actual_shape,
-                    opacity=float(actual_opacity),
-                    hover_label=f"{region} Actual",
-                    customdata=actual_da_plot.index,
-                    mode=actual_mode
-                )
-
-        if da_start_ts <= latest_actual_plot_time <= da_end_ts:
-            fig_da.add_vline(x=latest_actual_plot_time, line_width=2, line_dash="dot")
-            fig_da.add_annotation(
-                x=latest_actual_plot_time,
-                y=1,
-                xref="x",
-                yref="paper",
-                text="Latest actual",
-                showarrow=False,
-                xanchor="left",
-                yanchor="bottom",
-                yshift=6
+            st.metric(
+                "Active Model",
+                ", ".join(active_models) if active_models else "None",
             )
 
-        fig_da.update_layout(
-            title="Chart 1: Actuals vs DAM Proxy Forecast",
-            xaxis_title="Time",
-            yaxis_title="MW",
-            hovermode="x unified",
-            height=int(chart_height),
-            xaxis=dict(range=[da_start_ts, da_end_ts]),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="left",
-                x=0
-            ),
-        )
+        # -----------------------------
+        # CHART 1: NP3-565
+        # -----------------------------
 
-        st.plotly_chart(fig_da, use_container_width=True, key="tab4_da_chart")
+        st.subheader("NP3-565 Load Forecast Model Weather")
 
-        # ---------------------------------------------------
-        # CHART 2 - STLF VS ACTUAL
-        # ---------------------------------------------------
-        fig_stlf = go.Figure()
-
-        for region in regions_to_plot:
-            if region in short_term_plot.columns:
-                width = float(forecast_total_width) if region == "ERCOT Total" else float(forecast_zone_width)
-
-                add_series_trace(
-                    fig_stlf,
-                    x=short_term_plot.index,
-                    y=short_term_plot[region],
-                    name=f"{region} STLF",
-                    width=width,
-                    dash=forecast_dash,
-                    shape=forecast_shape,
-                    opacity=float(forecast_opacity),
-                    hover_label=f"{region} STLF",
-                    mode="lines"
-                )
-
-                if show_actuals:
-                    aligned_actual = align_actuals_to_stlf_grid(actual_stlf_plot, short_term_plot, region)
-                    if not aligned_actual.empty:
-                        awidth = float(actual_total_width) if region == "ERCOT Total" else float(actual_zone_width)
-                        add_series_trace(
-                            fig_stlf,
-                            x=aligned_actual["ForecastTime"],
-                            y=aligned_actual["Actual"],
-                            name=f"{region} Actual",
-                            width=awidth,
-                            dash=actual_dash,
-                            shape=actual_shape,
-                            opacity=float(actual_opacity),
-                            hover_label=f"{region} Actual",
-                            customdata=aligned_actual["ActualTime"],
-                            mode=actual_mode
-                        )
-
-        if stlf_start_ts <= latest_actual_plot_time <= stlf_end_ts:
-            fig_stlf.add_vline(x=latest_actual_plot_time, line_width=2, line_dash="dot")
-            fig_stlf.add_annotation(
-                x=latest_actual_plot_time,
-                y=1,
-                xref="x",
-                yref="paper",
-                text="Latest actual",
-                showarrow=False,
-                xanchor="left",
-                yanchor="bottom",
-                yshift=6
+        if np3565_plot.empty:
+            st.info("No NP3-565 data available for the selected window.")
+        else:
+            make_np3565_chart(
+                np3565_plot,
+                f"{region_title} Load Forecast Model Weather - NP3-565",
+                regions_to_plot,
+                height=int(chart_height),
             )
 
-        fig_stlf.update_layout(
-            title="Chart 2: Actuals vs Short-Term Load Forecast (STLF)",
-            xaxis_title="Time",
-            yaxis_title="MW",
-            hovermode="x unified",
-            height=int(chart_height),
-            xaxis=dict(range=[stlf_start_ts, stlf_end_ts]),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.02,
-                xanchor="left",
-                x=0
-            ),
-        )
+        # -----------------------------
+        # CHART 2: NP3-562
+        # -----------------------------
 
-        st.plotly_chart(fig_stlf, use_container_width=True, key="tab4_stlf_chart")
+        st.subheader("NP3-562 Intra-Hour Load Forecast")
 
-        # ---------------------------------------------------
-        # COMPARISON TABLES
-        # ---------------------------------------------------
-        if show_tables:
-            with st.expander("Chart 1 comparison table", expanded=False):
-                da_compare_df = build_hourly_compare_table(
-                    seven_day_plot,
-                    actual_da_plot,
-                    regions_to_plot,
-                    "DAM Proxy"
-                )
+        if np3562_plot.empty:
+            st.info("No NP3-562 data available for the selected window.")
+        else:
+            make_np3562_chart(
+                np3562_plot,
+                f"{region_title} Intra-Hour Load Forecast - NP3-562",
+                regions_to_plot,
+                selected_models,
+                height=int(chart_height),
+            )
 
-                if da_compare_df.empty:
-                    st.info("No overlapping DAM proxy vs actual rows.")
-                else:
-                    miss_count = da_compare_df[
-                        da_compare_df["Error_Pct"].notna() & (da_compare_df["Error_Pct"].abs() > miss_threshold_pct)
-                    ].shape[0]
+        # -----------------------------
+        # RAW DATA VIEW
+        # -----------------------------
 
-                    st.caption(
-                        f"Rows highlighted in red have absolute misses greater than {miss_threshold_pct}%. "
-                        f"Miss count: {miss_count}"
+        with st.expander("Show raw forecast data", expanded=False):
+            tab1, tab2, tab3 = st.tabs(["NP3-565", "NP3-562", "NP3-562 Debug"])
+
+            with tab1:
+                cols_565 = [
+                    c for c in regions_to_plot
+                    if c in np3565_plot.columns
+                ]
+
+                if cols_565:
+                    display_565 = np3565_plot[cols_565].rename(
+                        columns={c: REGION_LABELS.get(c, c) for c in cols_565}
                     )
 
                     st.dataframe(
-                        style_compare_table(da_compare_df, miss_threshold_pct),
+                        display_565,
                         use_container_width=True,
-                        hide_index=True
                     )
+                else:
+                    st.info("No NP3-565 columns selected.")
 
-            with st.expander("Chart 2 comparison table", expanded=False):
-                stlf_compare_df = build_stlf_compare_table(
-                    short_term_plot,
-                    actual_stlf_plot,
-                    regions_to_plot
+            with tab2:
+                cols_562 = ["ForecastTime", "model", "inUseFlag"] + [
+                    c for c in regions_to_plot
+                    if c in np3562_plot.columns
+                ]
+
+                display_562 = np3562_plot[
+                    np3562_plot["model"].isin(selected_models)
+                ][cols_562].copy()
+
+                display_562 = display_562.rename(
+                    columns={c: REGION_LABELS.get(c, c) for c in cols_562}
                 )
 
-                if stlf_compare_df.empty:
-                    st.info("No overlapping STLF vs actual rows.")
-                else:
-                    miss_count = stlf_compare_df[
-                        stlf_compare_df["Error_Pct"].notna() & (stlf_compare_df["Error_Pct"].abs() > miss_threshold_pct)
-                    ].shape[0]
+                st.dataframe(
+                    display_562,
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-                    st.caption(
-                        f"Rows highlighted in red have absolute misses greater than {miss_threshold_pct}%. "
-                        f"Miss count: {miss_count}"
-                    )
+            with tab3:
+                st.write("Available models:", available_models)
+                st.write("Active models:", active_models)
 
-                    st.dataframe(
-                        style_compare_table(stlf_compare_df, miss_threshold_pct),
-                        use_container_width=True,
-                        hide_index=True
-                    )
+                st.dataframe(
+                    df_562[["model", "inUseFlag"]]
+                    .drop_duplicates()
+                    .sort_values(["model", "inUseFlag"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-        # ---------------------------------------------------
-        # DOWNLOADS
-        # ---------------------------------------------------
-        st.markdown("### Downloads")
-
-        st.download_button(
-            "Download DAM proxy plot data CSV",
-            data=seven_day_plot.reset_index().to_csv(index=False).encode("utf-8"),
-            file_name="dam_proxy_plot_data.csv",
-            mime="text/csv",
-            key="tab4_download_561"
-        )
-
-        st.download_button(
-            "Download STLF plot data CSV",
-            data=short_term_plot.reset_index().to_csv(index=False).encode("utf-8"),
-            file_name="stlf_plot_data.csv",
-            mime="text/csv",
-            key="tab4_download_562"
-        )
-
-        if not actual_curve.empty:
-            actual_export_cols = [c for c in regions_to_plot if c in actual_curve.columns]
-            actual_export = actual_curve[actual_export_cols].copy()
-            actual_export.insert(0, "PlotTime", actual_curve["PlotTime"])
-            actual_export.insert(0, "HourEnding", actual_curve.index)
-
-            st.download_button(
-                "Download actual data CSV",
-                data=actual_export.reset_index(drop=True).to_csv(index=False).encode("utf-8"),
-                file_name="np6_345_actual_plot_data.csv",
-                mime="text/csv",
-                key="tab4_download_actual"
-            )
-
-        # ---------------------------------------------------
-        # DEBUG
-        # ---------------------------------------------------
-        if show_debug:
-            with st.expander("Debug info"):
-                st.write(f"DAM proxy chart window: {da_start_ts} to {da_end_ts}")
-                st.write(f"STLF chart window: {stlf_start_ts} to {stlf_end_ts}")
-                st.write(f"Latest actual PlotTime shown: {latest_actual_plot_time}")
-                st.write(f"Latest actual HourEnding shown: {latest_actual_hour_ending}")
-                st.write("Regions to plot:")
-                st.write(regions_to_plot)
-
-                st.write(f"NP3-561 endpoint: {endpoint_561}")
-                st.write("NP3-561 columns:")
-                st.write(list(raw_561.columns))
-
-                st.write(f"NP3-562 endpoint: {endpoint_562}")
                 st.write("NP3-562 columns:")
-                st.write(list(raw_562.columns))
+                st.write(list(df_562.columns))
 
-                st.write(f"NP6-345 endpoint: {endpoint_actual}")
-                st.write("NP6-345 columns:")
-                st.write(list(raw_actual.columns))
+                st.write("NP3-565 columns:")
+                st.write(list(df_565.columns))
 
     except Exception as e:
         st.error(str(e))
