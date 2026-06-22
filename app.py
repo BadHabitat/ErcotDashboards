@@ -865,117 +865,120 @@ elif page == "Wind Trader View":
     def normalize_actual_regional_df(df: pd.DataFrame):
         df = convert_columns(df.copy())
 
-        time_col = detect_time_col(df)
-        if not time_col:
-            raise ValueError(f"Actuals: Could not detect timestamp column. Columns: {list(df.columns)}")
+        time_col = "intervalEnding"
+        required_cols = [
+            "postedDatetime",
+            "intervalEnding",
+            "genSystemWide",
+            "panhandle",
+            "coastal",
+            "south",
+            "west",
+            "north",
+        ]
+
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Actuals missing expected columns: {missing}. Columns: {list(df.columns)}")
 
         df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
         df = df.dropna(subset=[time_col]).copy()
 
-        wide_cols = find_main_wide_region_columns(df)
-        if wide_cols:
-            out = df[[time_col] + list(wide_cols.values())].copy()
-            out = out.rename(columns={v: k for k, v in wide_cols.items()})
+        out = df[
+            [
+                time_col,
+                "genSystemWide",
+                "panhandle",
+                "coastal",
+                "south",
+                "west",
+                "north",
+            ]
+        ].copy()
 
-            for c in out.columns:
-                if c != time_col:
-                    out[c] = pd.to_numeric(out[c], errors="coerce")
+        out = out.rename(
+            columns={
+                "genSystemWide": "ERCOT Total",
+                "panhandle": "Panhandle",
+                "coastal": "Coastal",
+                "south": "South",
+                "west": "West",
+                "north": "North",
+            }
+        )
 
-            out = (
-                out.sort_values(time_col)
-                .drop_duplicates(subset=[time_col], keep="last")
-                .set_index(time_col)
-                .resample("5min")
-                .mean()
-            )
+        for c in ["ERCOT Total", "Panhandle", "Coastal", "South", "West", "North"]:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
 
-            return add_main_total_if_missing(out), time_col
+        out = (
+            out.sort_values(time_col)
+            .drop_duplicates(subset=[time_col], keep="last")
+            .set_index(time_col)
+            .resample("5min")
+            .mean()
+        )
 
-        region_col, value_col = find_long_region_and_value_columns(df)
-        if region_col and value_col:
-            temp = df[[time_col, region_col, value_col]].copy()
-            temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
-            temp = temp.dropna(subset=[value_col]).copy()
-            temp["series"] = temp[region_col].map(normalize_main_region_name)
-            temp = temp.dropna(subset=["series"]).copy()
-
-            out = (
-                temp.pivot_table(
-                    index=time_col,
-                    columns="series",
-                    values=value_col,
-                    aggfunc="mean"
-                )
-                .sort_index()
-                .resample("5min")
-                .mean()
-            )
-
-            return add_main_total_if_missing(out), time_col
-
-        raise ValueError(f"Actuals: Could not detect regional actuals format. Columns: {list(df.columns)}")
+        return out, time_col
 
 
     def normalize_intrahour_forecast_long(df: pd.DataFrame):
         df = convert_columns(df.copy())
 
-        posted_col = detect_posted_col(df)
-        target_col = detect_target_col(df, posted_col)
+        required_cols = [
+            "postedDatetime",
+            "intervalEnding",
+            "region",
+            "value",
+            "model",
+            "inUseFlag",
+        ]
 
-        if not posted_col:
-            raise ValueError(
-                f"Intra-hour forecast: Could not detect posted timestamp column. Columns: {list(df.columns)}")
-        if not target_col:
-            raise ValueError(
-                f"Intra-hour forecast: Could not detect target timestamp column. Columns: {list(df.columns)}")
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"Intra-hour forecast missing expected columns: {missing}. Columns: {list(df.columns)}")
 
-        df[posted_col] = pd.to_datetime(df[posted_col], errors="coerce")
-        df[target_col] = pd.to_datetime(df[target_col], errors="coerce")
-        df = df.dropna(subset=[posted_col, target_col]).copy()
+        df["postedDatetime"] = pd.to_datetime(df["postedDatetime"], errors="coerce")
+        df["intervalEnding"] = pd.to_datetime(df["intervalEnding"], errors="coerce")
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
 
-        wide_cols = find_main_wide_region_columns(df)
-        if wide_cols:
-            keep_cols = [posted_col, target_col] + list(wide_cols.values())
-            out = df[keep_cols].copy()
-            out = out.rename(columns={v: k for k, v in wide_cols.items()})
+        df = df.dropna(subset=["postedDatetime", "intervalEnding", "region", "value"]).copy()
 
-            region_names = [c for c in main_region_order() if c in out.columns]
-            for c in region_names:
-                out[c] = pd.to_numeric(out[c], errors="coerce")
+        # Keep only model rows marked in use when available.
+        active = df[df["inUseFlag"].astype(str).str.strip().str.upper().isin(["Y", "YES", "TRUE", "1"])].copy()
+        if not active.empty:
+            df = active
 
-            long_df = out.melt(
-                id_vars=[posted_col, target_col],
-                value_vars=region_names,
-                var_name="series",
-                value_name="mw"
-            ).dropna(subset=["mw"])
+        region_map = {
+            "systemwide": "ERCOT Total",
+            "systemtotal": "ERCOT Total",
+            "ercottotal": "ERCOT Total",
+            "total": "ERCOT Total",
+            "panhandle": "Panhandle",
+            "coastal": "Coastal",
+            "south": "South",
+            "west": "West",
+            "north": "North",
+        }
 
-            long_df = long_df.rename(columns={
-                posted_col: "posted_ts",
-                target_col: "target_ts"
-            })
+        def map_region(x):
+            key = str(x).strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+            for raw, display in region_map.items():
+                if key == raw or raw in key:
+                    return display
+            return None
 
-            return long_df, posted_col, target_col
+        df["series"] = df["region"].map(map_region)
+        df = df.dropna(subset=["series"]).copy()
 
-        region_col, value_col = find_long_region_and_value_columns(df)
-        if region_col and value_col:
-            temp = df[[posted_col, target_col, region_col, value_col]].copy()
-            temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
-            temp = temp.dropna(subset=[value_col]).copy()
-            temp["series"] = temp[region_col].map(normalize_main_region_name)
-            temp = temp.dropna(subset=["series"]).copy()
+        out = df.rename(
+            columns={
+                "postedDatetime": "posted_ts",
+                "intervalEnding": "target_ts",
+                "value": "mw",
+            }
+        )
 
-            temp = temp.rename(columns={
-                posted_col: "posted_ts",
-                target_col: "target_ts",
-                value_col: "mw"
-            })
-
-            return temp[["posted_ts", "target_ts", "series", "mw"]], posted_col, target_col
-
-        raise ValueError(
-            f"Intra-hour forecast: Could not detect regional forecast format. Columns: {list(df.columns)}")
-
+        return out[["posted_ts", "target_ts", "series", "mw"]], "postedDatetime", "intervalEnding"
 
     def build_intrahour_lead_curve(forecast_long: pd.DataFrame, target_lead_minutes: int):
         df = forecast_long.copy()
@@ -1009,148 +1012,87 @@ elif page == "Wind Trader View":
         return add_main_total_if_missing(wide)
 
 
-    # =====================================================
-    # NP4-732 PARSER
-    # =====================================================
     def normalize_np4732_hourly(df: pd.DataFrame):
-        df = df.copy()
+        df = convert_columns(df.copy())
 
-        # -----------------------------
-        # flexible column picker
-        # -----------------------------
-        def norm(s):
-            return str(s).strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+        required_cols = [
+            "postedDatetime",
+            "deliveryDate",
+            "hourEnding",
+            "genSystemWide",
+            "COPHSLSystemWide",
+            "STWPFSystemWide",
+            "WGRPPSystemWide",
+            "genLoadZoneSouthHouston",
+            "COPHSLLoadZoneSouthHouston",
+            "STWPFLoadZoneSouthHouston",
+            "WGRPPLoadZoneSouthHouston",
+            "genLoadZoneWest",
+            "COPHSLLoadZoneWest",
+            "STWPFLoadZoneWest",
+            "WGRPPLoadZoneWest",
+            "genLoadZoneNorth",
+            "COPHSLLoadZoneNorth",
+            "STWPFLoadZoneNorth",
+            "WGRPPLoadZoneNorth",
+            "HSLSystemWide",
+        ]
 
-        col_map = {norm(c): c for c in df.columns}
-
-        def pick(*candidates):
-            for cand in candidates:
-                key = norm(cand)
-                if key in col_map:
-                    return col_map[key]
-            return None
-
-        delivery_col = pick("DELIVERY_DATE", "deliveryDate")
-        he_col = pick("HOUR_ENDING", "hourEnding")
-        posted_col = pick("postedDatetime")
-        dst_col = pick("DSTFlag")
-
-        missing = []
-        if not delivery_col:
-            missing.append("DELIVERY_DATE/deliveryDate")
-        if not he_col:
-            missing.append("HOUR_ENDING/hourEnding")
-
+        missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            raise ValueError(
-                f"NP4-732 missing required columns: {missing}. Columns: {list(df.columns)}"
-            )
+            raise ValueError(f"NP4-732 missing expected columns: {missing}. Columns: {list(df.columns)}")
 
-        df[delivery_col] = pd.to_datetime(df[delivery_col], errors="coerce")
-        df[he_col] = pd.to_numeric(df[he_col], errors="coerce")
-        if posted_col:
-            df[posted_col] = pd.to_datetime(df[posted_col], errors="coerce")
+        df["postedDatetime"] = pd.to_datetime(df["postedDatetime"], errors="coerce")
+        df["deliveryDate"] = pd.to_datetime(df["deliveryDate"], errors="coerce")
+        df["hourEnding"] = pd.to_numeric(df["hourEnding"], errors="coerce")
 
-        df = df.dropna(subset=[delivery_col, he_col]).copy()
+        df = df.dropna(subset=["deliveryDate", "hourEnding"]).copy()
 
-        # ERCOT HE 1-24 => ending timestamp
-        df["target_ts"] = df[delivery_col] + pd.to_timedelta(df[he_col], unit="h")
+        # ERCOT HE 1-24 => interval-ending timestamp
+        df["target_ts"] = df["deliveryDate"] + pd.to_timedelta(df["hourEnding"], unit="h")
 
-        # -----------------------------
-        # column mappings for both schema variants
-        # -----------------------------
         metric_region_map = {
-            # system wide
-            "SYSTEM_WIDE_GEN": ("Actual Gen", "ERCOT Total"),
             "genSystemWide": ("Actual Gen", "ERCOT Total"),
-
-            "COP_HSL_SYSTEM_WIDE": ("COP HSL", "ERCOT Total"),
             "COPHSLSystemWide": ("COP HSL", "ERCOT Total"),
-
-            "STWPF_SYSTEM_WIDE": ("STWPF", "ERCOT Total"),
             "STWPFSystemWide": ("STWPF", "ERCOT Total"),
-
-            "WGRPP_SYSTEM_WIDE": ("WGRPP", "ERCOT Total"),
             "WGRPPSystemWide": ("WGRPP", "ERCOT Total"),
-
-            "SYSTEM_WIDE_HSL": ("System HSL", "ERCOT Total"),
             "HSLSystemWide": ("System HSL", "ERCOT Total"),
 
-            # south houston
-            "GEN_LZ_SOUTH_HOUSTON": ("Actual Gen", "South Houston"),
             "genLoadZoneSouthHouston": ("Actual Gen", "South Houston"),
-
-            "COP_HSL_LZ_SOUTH_HOUSTON": ("COP HSL", "South Houston"),
             "COPHSLLoadZoneSouthHouston": ("COP HSL", "South Houston"),
-
-            "STWPF_LZ_SOUTH_HOUSTON": ("STWPF", "South Houston"),
             "STWPFLoadZoneSouthHouston": ("STWPF", "South Houston"),
-
-            "WGRPP_LZ_SOUTH_HOUSTON": ("WGRPP", "South Houston"),
             "WGRPPLoadZoneSouthHouston": ("WGRPP", "South Houston"),
 
-            # west
-            "GEN_LZ_WEST": ("Actual Gen", "West"),
             "genLoadZoneWest": ("Actual Gen", "West"),
-
-            "COP_HSL_LZ_WEST": ("COP HSL", "West"),
             "COPHSLLoadZoneWest": ("COP HSL", "West"),
-
-            "STWPF_LZ_WEST": ("STWPF", "West"),
             "STWPFLoadZoneWest": ("STWPF", "West"),
-
-            "WGRPP_LZ_WEST": ("WGRPP", "West"),
             "WGRPPLoadZoneWest": ("WGRPP", "West"),
 
-            # north
-            "GEN_LZ_NORTH": ("Actual Gen", "North"),
             "genLoadZoneNorth": ("Actual Gen", "North"),
-
-            "COP_HSL_LZ_NORTH": ("COP HSL", "North"),
             "COPHSLLoadZoneNorth": ("COP HSL", "North"),
-
-            "STWPF_LZ_NORTH": ("STWPF", "North"),
             "STWPFLoadZoneNorth": ("STWPF", "North"),
-
-            "WGRPP_LZ_NORTH": ("WGRPP", "North"),
             "WGRPPLoadZoneNorth": ("WGRPP", "North"),
         }
 
         long_frames = []
 
         for raw_col, (metric_name, region_name) in metric_region_map.items():
-            if raw_col not in df.columns:
-                continue
-
-            temp = df[["target_ts", raw_col]].copy()
-            if posted_col:
-                temp["posted_ts"] = df[posted_col]
-
+            temp = df[["postedDatetime", "target_ts", raw_col]].copy()
+            temp["posted_ts"] = temp["postedDatetime"]
             temp["metric"] = metric_name
             temp["region"] = region_name
             temp["mw"] = pd.to_numeric(temp[raw_col], errors="coerce")
             temp = temp.dropna(subset=["mw"]).copy()
 
-            keep_cols = ["target_ts", "region", "metric", "mw"]
-            if posted_col:
-                keep_cols.insert(1, "posted_ts")
-
-            long_frames.append(temp[keep_cols])
-
-        if not long_frames:
-            raise ValueError(
-                f"NP4-732 parser found no usable metric columns. Columns: {list(df.columns)}"
-            )
+            long_frames.append(temp[["target_ts", "posted_ts", "region", "metric", "mw"]])
 
         long_df = pd.concat(long_frames, ignore_index=True)
 
-        # if posted timestamp exists, keep the latest row per target/metric/region
-        if "posted_ts" in long_df.columns:
-            long_df = (
-                long_df.sort_values(["target_ts", "metric", "region", "posted_ts"])
-                .drop_duplicates(subset=["target_ts", "metric", "region"], keep="last")
-                .copy()
-            )
+        long_df = (
+            long_df.sort_values(["target_ts", "metric", "region", "posted_ts"])
+            .drop_duplicates(subset=["target_ts", "metric", "region"], keep="last")
+            .copy()
+        )
 
         wide = (
             long_df.pivot_table(
@@ -1163,7 +1105,6 @@ elif page == "Wind Trader View":
         )
 
         return long_df, wide
-
 
     # =====================================================
     # CONTROLS
@@ -2022,44 +1963,56 @@ elif page == "Solar Trader View":
     # NP4-746 - 5 MIN ACTUALS
     # =====================================================
     def normalize_np4746_actual(df: pd.DataFrame):
-        df = df.copy()
+        df = convert_columns(df.copy())
 
-        time_col = pick_col(df, ["INTERVAL_ENDING", "IntervalEnding", "intervalEnding"])
-        if not time_col:
-            raise ValueError(f"NP4-746: could not detect interval ending column. Columns: {list(df.columns)}")
+        time_col = "intervalEnding"
+
+        required_cols = [
+            "postedDatetime",
+            "intervalEnding",
+            "genSystemWide",
+            "genCenterWest",
+            "genNorthWest",
+            "genFarWest",
+            "genFarEast",
+            "genSouthEast",
+            "genCenterEast",
+        ]
+
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            raise ValueError(f"NP4-746 solar actuals missing expected columns: {missing}. Columns: {list(df.columns)}")
 
         df[time_col] = pd.to_datetime(df[time_col], errors="coerce")
         df = df.dropna(subset=[time_col]).copy()
 
-        region_map = {
-            "SYSTEM_WIDE_GEN": "ERCOT Total",
-            "systemWideGen": "ERCOT Total",
-            "CenterWest_GEN": "Center West",
-            "centerWestGen": "Center West",
-            "NorthWest_GEN": "North West",
-            "northWestGen": "North West",
-            "FarWest_GEN": "Far West",
-            "farWestGen": "Far West",
-            "FarEast_GEN": "Far East",
-            "farEastGen": "Far East",
-            "SouthEast_GEN": "South East",
-            "southEastGen": "South East",
-            "CenterEast_GEN": "Center East",
-            "centerEastGen": "Center East",
-            "SYSTEM_WIDE_HSL": "ERCOT Total HSL",
-            "systemWideHSL": "ERCOT Total HSL",
-        }
+        out = df[
+            [
+                time_col,
+                "genSystemWide",
+                "genCenterWest",
+                "genNorthWest",
+                "genFarWest",
+                "genFarEast",
+                "genSouthEast",
+                "genCenterEast",
+            ]
+        ].copy()
 
-        keep = [time_col]
-        rename_map = {}
-        for raw_col, display in region_map.items():
-            if raw_col in df.columns:
-                keep.append(raw_col)
-                rename_map[raw_col] = display
+        out = out.rename(
+            columns={
+                "genSystemWide": "ERCOT Total",
+                "genCenterWest": "Center West",
+                "genNorthWest": "North West",
+                "genFarWest": "Far West",
+                "genFarEast": "Far East",
+                "genSouthEast": "South East",
+                "genCenterEast": "Center East",
+            }
+        )
 
-        out = df[keep].copy().rename(columns=rename_map)
-        for c in out.columns:
-            if c != time_col:
+        for c in solar_region_order():
+            if c in out.columns:
                 out[c] = pd.to_numeric(out[c], errors="coerce")
 
         out = (
@@ -2070,146 +2023,119 @@ elif page == "Solar Trader View":
             .mean()
         )
 
-        out = add_solar_total_if_missing(out)
         return out, time_col
-
     # =====================================================
     # NP4-745 - HOURLY ACTUAL / STPPF / PVGRPP / HSL
     # =====================================================
     def normalize_np4745_hourly(df: pd.DataFrame):
-        df = df.copy()
+        df = convert_columns(df.copy())
 
-        def norm(s):
-            return str(s).strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+        required_cols = [
+            "postedDatetime",
+            "deliveryDate",
+            "hourEnding",
+            "genSystemWide",
+            "COPHSLSystemWide",
+            "STPPFSystemWide",
+            "PVGRPPSystemWide",
+            "genCenterWest",
+            "COPHSLCenterWest",
+            "STPPFCenterWest",
+            "PVGRPPCenterWest",
+            "genNorthWest",
+            "COPHSLNorthWest",
+            "STPPFNorthWest",
+            "PVGRPPNorthWest",
+            "genFarWest",
+            "COPHSLFarWest",
+            "STPPFFarWest",
+            "PVGRPPFarWest",
+            "genFarEast",
+            "COPHSLFarEast",
+            "STPPFFarEast",
+            "PVGRPPFarEast",
+            "genSouthEast",
+            "COPHSLSouthEast",
+            "STPPFSouthEast",
+            "PVGRPPSouthEast",
+            "genCenterEast",
+            "COPHSLCenterEast",
+            "STPPFCenterEast",
+            "PVGRPPCenterEast",
+            "HSLSystemWide",
+        ]
 
-        col_map = {norm(c): c for c in df.columns}
-
-        def pick(*candidates):
-            for cand in candidates:
-                key = norm(cand)
-                if key in col_map:
-                    return col_map[key]
-            return None
-
-        delivery_col = pick("DELIVERY_DATE", "deliveryDate")
-        he_col = pick("HOUR_ENDING", "hourEnding")
-        posted_col = pick("postedDatetime")
-
-        missing = []
-        if not delivery_col:
-            missing.append("DELIVERY_DATE/deliveryDate")
-        if not he_col:
-            missing.append("HOUR_ENDING/hourEnding")
+        missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            raise ValueError(f"NP4-745 missing required columns: {missing}. Columns: {list(df.columns)}")
+            raise ValueError(
+                f"NP4-745 hourly solar outlook missing expected columns: {missing}. Columns: {list(df.columns)}")
 
-        df[delivery_col] = pd.to_datetime(df[delivery_col], errors="coerce")
-        df[he_col] = pd.to_numeric(df[he_col], errors="coerce")
-        if posted_col:
-            df[posted_col] = pd.to_datetime(df[posted_col], errors="coerce")
+        df["postedDatetime"] = pd.to_datetime(df["postedDatetime"], errors="coerce")
+        df["deliveryDate"] = pd.to_datetime(df["deliveryDate"], errors="coerce")
+        df["hourEnding"] = pd.to_numeric(df["hourEnding"], errors="coerce")
 
-        df = df.dropna(subset=[delivery_col, he_col]).copy()
-        df["target_ts"] = df[delivery_col] + pd.to_timedelta(df[he_col], unit="h")
+        df = df.dropna(subset=["postedDatetime", "deliveryDate", "hourEnding"]).copy()
+
+        # ERCOT hour-ending convention: HE 1-24 maps to deliveryDate + hourEnding.
+        df["target_ts"] = df["deliveryDate"] + pd.to_timedelta(df["hourEnding"], unit="h")
 
         metric_region_map = {
-            "SYSTEM_WIDE_GEN": ("Actual Gen", "ERCOT Total"),
             "genSystemWide": ("Actual Gen", "ERCOT Total"),
-            "COP_HSL_SYSTEM_WIDE": ("COP HSL", "ERCOT Total"),
             "COPHSLSystemWide": ("COP HSL", "ERCOT Total"),
-            "STPPF_SYSTEM_WIDE": ("STPPF", "ERCOT Total"),
             "STPPFSystemWide": ("STPPF", "ERCOT Total"),
-            "PVGRPP_SYSTEM_WIDE": ("PVGRPP", "ERCOT Total"),
             "PVGRPPSystemWide": ("PVGRPP", "ERCOT Total"),
-            "SYSTEM_WIDE_HSL": ("System HSL", "ERCOT Total"),
             "HSLSystemWide": ("System HSL", "ERCOT Total"),
 
-            "GEN_CenterWest": ("Actual Gen", "Center West"),
             "genCenterWest": ("Actual Gen", "Center West"),
-            "COP_HSL_CenterWest": ("COP HSL", "Center West"),
             "COPHSLCenterWest": ("COP HSL", "Center West"),
-            "STPPF_CenterWest": ("STPPF", "Center West"),
             "STPPFCenterWest": ("STPPF", "Center West"),
-            "PVGRPP_CenterWest": ("PVGRPP", "Center West"),
             "PVGRPPCenterWest": ("PVGRPP", "Center West"),
 
-            "GEN_NorthWest": ("Actual Gen", "North West"),
             "genNorthWest": ("Actual Gen", "North West"),
-            "COP_HSL_NorthWest": ("COP HSL", "North West"),
             "COPHSLNorthWest": ("COP HSL", "North West"),
-            "STPPF_NorthWest": ("STPPF", "North West"),
             "STPPFNorthWest": ("STPPF", "North West"),
-            "PVGRPP_NorthWest": ("PVGRPP", "North West"),
             "PVGRPPNorthWest": ("PVGRPP", "North West"),
 
-            "GEN_FarWest": ("Actual Gen", "Far West"),
             "genFarWest": ("Actual Gen", "Far West"),
-            "COP_HSL_FarWest": ("COP HSL", "Far West"),
             "COPHSLFarWest": ("COP HSL", "Far West"),
-            "STPPF_FarWest": ("STPPF", "Far West"),
             "STPPFFarWest": ("STPPF", "Far West"),
-            "PVGRPP_FarWest": ("PVGRPP", "Far West"),
             "PVGRPPFarWest": ("PVGRPP", "Far West"),
 
-            "GEN_FarEast": ("Actual Gen", "Far East"),
             "genFarEast": ("Actual Gen", "Far East"),
-            "COP_HSL_FarEast": ("COP HSL", "Far East"),
             "COPHSLFarEast": ("COP HSL", "Far East"),
-            "STPPF_FarEast": ("STPPF", "Far East"),
             "STPPFFarEast": ("STPPF", "Far East"),
-            "PVGRPP_FarEast": ("PVGRPP", "Far East"),
             "PVGRPPFarEast": ("PVGRPP", "Far East"),
 
-            "GEN_SouthEast": ("Actual Gen", "South East"),
             "genSouthEast": ("Actual Gen", "South East"),
-            "COP_HSL_SouthEast": ("COP HSL", "South East"),
             "COPHSLSouthEast": ("COP HSL", "South East"),
-            "STPPF_SouthEast": ("STPPF", "South East"),
             "STPPFSouthEast": ("STPPF", "South East"),
-            "PVGRPP_SouthEast": ("PVGRPP", "South East"),
             "PVGRPPSouthEast": ("PVGRPP", "South East"),
 
-            "GEN_CenterEast": ("Actual Gen", "Center East"),
             "genCenterEast": ("Actual Gen", "Center East"),
-            "COP_HSL_CenterEast": ("COP HSL", "Center East"),
             "COPHSLCenterEast": ("COP HSL", "Center East"),
-            "STPPF_CenterEast": ("STPPF", "Center East"),
             "STPPFCenterEast": ("STPPF", "Center East"),
-            "PVGRPP_CenterEast": ("PVGRPP", "Center East"),
             "PVGRPPCenterEast": ("PVGRPP", "Center East"),
         }
 
         long_frames = []
 
         for raw_col, (metric_name, region_name) in metric_region_map.items():
-            if raw_col not in df.columns:
-                continue
-
-            temp = df[["target_ts", raw_col]].copy()
-            if posted_col:
-                temp["posted_ts"] = df[posted_col]
-
+            temp = df[["postedDatetime", "target_ts", raw_col]].copy()
+            temp["posted_ts"] = temp["postedDatetime"]
             temp["metric"] = metric_name
             temp["region"] = region_name
             temp["mw"] = pd.to_numeric(temp[raw_col], errors="coerce")
             temp = temp.dropna(subset=["mw"]).copy()
 
-            keep_cols = ["target_ts", "region", "metric", "mw"]
-            if posted_col:
-                keep_cols.insert(1, "posted_ts")
-
-            long_frames.append(temp[keep_cols])
-
-        if not long_frames:
-            raise ValueError(f"NP4-745 parser found no usable metric columns. Columns: {list(df.columns)}")
+            long_frames.append(temp[["target_ts", "posted_ts", "region", "metric", "mw"]])
 
         long_df = pd.concat(long_frames, ignore_index=True)
 
-        if "posted_ts" in long_df.columns:
-            long_df = (
-                long_df.sort_values(["target_ts", "metric", "region", "posted_ts"])
-                .drop_duplicates(subset=["target_ts", "metric", "region"], keep="last")
-                .copy()
-            )
+        long_df = (
+            long_df.sort_values(["target_ts", "metric", "region", "posted_ts"])
+            .drop_duplicates(subset=["target_ts", "metric", "region"], keep="last")
+            .copy()
+        )
 
         wide = (
             long_df.pivot_table(
@@ -2222,7 +2148,6 @@ elif page == "Solar Trader View":
         )
 
         return long_df, wide
-
     # =====================================================
     # NP4-443 - ACTIVE MODEL STATUS
     # =====================================================
@@ -2502,7 +2427,7 @@ elif page == "Solar Trader View":
                             y=x.values,
                             name=f"{r} Actual",
                             line=dict(
-                                color="white",   # change to "black" if using light mode
+                                color=color_map.get(r, None),
                                 width=4,
                             ),
                             hovertemplate=f"{r} Actual<br>%{{x}}<br>%{{y:,.0f}} MW<extra></extra>",
